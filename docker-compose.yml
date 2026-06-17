@@ -1,0 +1,62 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: hypermnesia
+      POSTGRES_PASSWORD: hypermnesia
+      POSTGRES_DB: hypermnesia
+    ports:
+      - "5432:5432"
+    volumes:
+      - hm_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hypermnesia"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      HM_DATABASE_URL: postgresql://hypermnesia:hypermnesia@db:5432/hypermnesia
+      HM_HOST: 0.0.0.0
+      HM_PORT: "8000"
+      HM_EMBEDDING_PROVIDER: fastembed
+      HM_EMBEDDING_MODEL: BAAI/bge-small-en-v1.5
+      # Replace with your own tokens before exposing this anywhere:
+      HM_AUTH_TOKENS: '{"dev-token":{"principal":"dev","scopes":["default","shared","user:dev-test"]}}'
+    ports:
+      - "8000:8000"
+    volumes:
+      - hm_models:/root/.cache/fastembed
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8000), 2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot e2e test runner: `docker compose --profile test run --rm tests`
+  tests:
+    build: .
+    profiles: ["test"]
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      HM_TEST_URL: http://server:8000/mcp
+      HM_TEST_TOKEN: dev-token
+      HM_TEST_SCOPE: user:dev-test
+    volumes:
+      - ./tests:/app/tests
+      - ./pyproject.toml:/app/pyproject.toml
+    command:
+      - sh
+      - -c
+      - pip install -q pytest pytest-asyncio && python -m pytest /app/tests -v
+
+volumes:
+  hm_pgdata:
+  hm_models:

@@ -1,0 +1,204 @@
+"""End-to-end integration tests against a running hypermnesia MCP server.
+
+Black-box: everything goes through the MCP tools over HTTP, exercising the full
+stack (FastMCP -> auth -> service -> pgvector -> embeddings).
+
+Run against the docker-compose stack:
+
+    docker compose up -d --build
+    pytest tests/test_e2e.py            # needs fastmcp + pytest-asyncio
+
+Skipped automatically if the server isn't reachable.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+import pytest
+
+from conftest import E2E_SCOPE, E2E_URL, make_client
+
+pytest.importorskip("fastmcp")
+
+pytestmark = pytest.mark.e2e
+
+
+@pytest.fixture(autouse=True)
+async def _server_up():
+    try:
+        async with make_client() as c:
+            await c.list_tools()
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"hypermnesia server not reachable at {E2E_URL}: {e}")
+
+
+@pytest.fixture
+async def client():
+    async with make_client() as c:
+        yield c
+
+
+@pytest.fixture
+def tag() -> str:
+    return "t-" + uuid.uuid4().hex[:10]
+
+
+async def _save(client, tag, content, description, **kw):
+    r = await client.call_tool(
+        "memory_save",
+        {
+            "content": content,
+            "description": description,
+            "scope": E2E_SCOPE,
+            "tags": [tag],
+            **kw,
+        },
+    )
+    return r.data
+
+
+async def test_lists_all_tools(client):
+    names = {t.name for t in await client.list_tools()}
+    assert {
+        "memory_save",
+        "memory_search",
+        "memory_get",
+        "memory_list",
+        "memory_delete",
+    } <= names
+
+
+async def test_full_crud_lifecycle(client, tag):
+    # CREATE
+    created = await _save(
+        client,
+        tag,
+        "Project hypermnesia is an MCP-based semantic memory store for agents.",
+        "hypermnesia = MCP semantic memory store",
+        type="project",
+    )
+    assert created["created"] is True
+    mid = created["memory"]["id"]
+    assert created["memory"]["owner_id"]  # stamped from the principal
+
+    # READ (get)
+    got = (await client.call_tool("memory_get", {"memory_id": mid})).data
+    assert got is not None and got["id"] == mid
+    assert tag in got["tags"]
+    assert got["type"] == "project"
+
+    # READ (list, filtered by our unique tag)
+    listed = (
+        await client.call_tool("memory_list", {"scope": E2E_SCOPE, "tags": [tag]})
+    ).data
+    assert any(m["id"] == mid for m in listed)
+
+    # DELETE
+    deleted = (await client.call_tool("memory_delete", {"memory_id": mid})).data
+    assert deleted["deleted"] is True
+
+    # gone
+    assert (await client.call_tool("memory_get", {"memory_id": mid})).data is None
+    # deleting again is a no-op
+    assert (await client.call_tool("memory_delete", {"memory_id": mid})).data[
+        "deleted"
+    ] is False
+
+
+async def test_semantic_recall_ranks_relevant_first(client, tag):
+    ids = []
+    try:
+        ids.append(
+            (
+                await _save(
+                    client,
+                    tag,
+                    "The user wants embedding models to run locally on CPU and be pluggable.",
+                    "User prefers local CPU pluggable embeddings",
+                )
+            )["memory"]["id"]
+        )
+        ids.append(
+            (
+                await _save(
+                    client,
+                    tag,
+                    "Deployment uses docker-compose with Postgres and pgvector.",
+                    "Deploy via docker-compose + pgvector",
+                )
+            )["memory"]["id"]
+        )
+
+        hits = (
+            await client.call_tool(
+                "memory_search",
+                {
+                    "query": "what embedding hardware and setup does the user want?",
+                    "scope": E2E_SCOPE,
+                    "tags": [tag],
+                    "k": 2,
+                },
+            )
+        ).data
+        assert len(hits) == 2
+        # the embeddings memory should rank above the deployment one
+        assert "embedding" in hits[0]["description"].lower()
+        assert hits[0]["similarity"] >= hits[1]["similarity"]
+        assert 0.0 <= hits[0]["similarity"] <= 1.0
+    finally:
+        for mid in ids:
+            await client.call_tool("memory_delete", {"memory_id": mid})
+
+
+async def test_save_dedupes_near_duplicate(client, tag):
+    a = await _save(
+        client,
+        tag,
+        "The user prefers pluggable local CPU embedding models.",
+        "pluggable local CPU embeddings",
+    )
+    assert a["created"] is True
+    try:
+        b = await _save(
+            client,
+            tag,
+            "The user prefers pluggable local CPU embedding models too.",
+            "pluggable local CPU embeddings",
+        )
+        # near-duplicate within the same scope updates instead of inserting
+        assert b["created"] is False
+        assert b["memory"]["id"] == a["memory"]["id"]
+    finally:
+        await client.call_tool("memory_delete", {"memory_id": a["memory"]["id"]})
+
+
+async def test_write_to_unauthorized_scope_is_rejected(client):
+    with pytest.raises(Exception) as exc:
+        await client.call_tool(
+            "memory_save",
+            {"content": "x", "description": "y", "scope": "user:not-allowed"},
+        )
+    assert "scope" in str(exc.value).lower()
+
+
+async def test_unauthenticated_call_is_rejected():
+    async with make_client(token=None) as c:
+        with pytest.raises(Exception) as exc:
+            await c.call_tool("memory_list", {"scope": E2E_SCOPE})
+    msg = str(exc.value).lower()
+    assert "authorization" in msg or "bearer" in msg
+
+
+async def test_search_only_returns_accessible_scopes(client, tag):
+    # Save in an allowed scope, then confirm a disallowed scope filter is refused.
+    saved = await _save(client, tag, "scoped memory content", "scoped memory")
+    try:
+        with pytest.raises(Exception) as exc:
+            await client.call_tool(
+                "memory_search",
+                {"query": "anything", "scope": "user:not-allowed", "k": 5},
+            )
+        assert "scope" in str(exc.value).lower()
+    finally:
+        await client.call_tool("memory_delete", {"memory_id": saved["memory"]["id"]})
