@@ -36,7 +36,7 @@ class Settings(BaseSettings):
 
     # --- server ---
     host: str = "127.0.0.1"
-    port: int = 8000
+    port: int = 8765
 
     # --- auth ---
     # JSON: {"<bearer-token>": {"principal": "agent-a", "scopes": ["shared", "user:dev-test"]}}

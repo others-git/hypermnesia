@@ -28,17 +28,17 @@ services:
     environment:
       HM_DATABASE_URL: postgresql://hypermnesia:hypermnesia@db:5432/hypermnesia
       HM_HOST: 0.0.0.0
-      HM_PORT: "8000"
+      HM_PORT: "8765"
       HM_EMBEDDING_PROVIDER: fastembed
       HM_EMBEDDING_MODEL: BAAI/bge-small-en-v1.5
       # Replace with your own tokens before exposing this anywhere:
       HM_AUTH_TOKENS: '{"dev-token":{"principal":"dev","scopes":["default","shared","user:dev-test"]}}'
     ports:
-      - "8000:8000"
+      - "8765:8765"
     volumes:
       - hm_models:/root/.cache/fastembed
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8000), 2).close()"]
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8765), 2).close()"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -51,7 +51,7 @@ services:
       server:
         condition: service_healthy
     environment:
-      HM_TEST_URL: http://server:8000/mcp
+      HM_TEST_URL: http://server:8765/mcp
       HM_TEST_TOKEN: dev-token
       HM_TEST_SCOPE: user:dev-test
     volumes:

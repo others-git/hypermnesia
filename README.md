@@ -38,7 +38,7 @@ docker compose -f docker-compose.yml -f docker-compose.release.yml up -d
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 ```
 
-The MCP server listens on `http://localhost:8000/mcp` (streamable HTTP). Point an MCP
+The MCP server listens on `http://localhost:8765/mcp` (streamable HTTP). Point an MCP
 client at it with header `Authorization: Bearer <your-token>`.
 
 > Tip: `export COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml` to drop the
@@ -53,7 +53,7 @@ Connecting the server is two steps: register it, then tell Claude when to call i
 Register the running server (HTTP transport, with the bearer token):
 
 ```bash
-claude mcp add --transport http hypermnesia http://localhost:8000/mcp \
+claude mcp add --transport http hypermnesia http://localhost:8765/mcp \
   --header "Authorization: Bearer dev-token" \
   --scope user        # available in every project; use --scope local/project to narrow
 ```
@@ -86,7 +86,7 @@ per project automatically (see below), so projects never trample each other.
   "mcpServers": {
     "hypermnesia": {
       "command": "npx",
-      "args": ["mcp-remote", "http://localhost:8000/mcp",
+      "args": ["mcp-remote", "http://localhost:8765/mcp",
                "--header", "Authorization: Bearer dev-token"]
     }
   }
@@ -96,7 +96,7 @@ per project automatically (see below), so projects never trample each other.
 ### Claude API / Agent SDK
 
 Pass the server via the MCP connector (the `mcp_servers` field), pointing at
-`http://localhost:8000/mcp` with the `Authorization: Bearer <token>` header.
+`http://localhost:8765/mcp` with the `Authorization: Bearer <token>` header.
 
 ## Project scoping (no trampling)
 

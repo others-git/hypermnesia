@@ -11,5 +11,5 @@ RUN pip install --no-cache-dir .
 ENV HM_EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5')"
 
-EXPOSE 8000
+EXPOSE 8765
 CMD ["hypermnesia"]
