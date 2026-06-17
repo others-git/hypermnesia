@@ -68,12 +68,13 @@ to a `CLAUDE.md` (project-level, or `~/.claude/CLAUDE.md` for all projects):
 ## Persistent memory (hypermnesia MCP)
 - At the start of a task, call `memory_search` for relevant prior context.
 - When you learn a durable fact, preference, or decision, call `memory_save` with a
-  one-line `description` and `scope: "user:dev-test"` (or `"shared"`).
+  one-line `description` — no `scope` needed; it defaults to this project.
+- Pass `scope: "shared"` only for things useful across every project.
 - Search before saving; prefer updating a near-duplicate over creating a new memory.
 ```
 
-The `scope` must be one the token is allowed to write (the sample `dev-token` grants
-`default`, `shared`, and `user:dev-test`).
+You can put this in a **single global** `~/.claude/CLAUDE.md` — memories are partitioned
+per project automatically (see below), so projects never trample each other.
 
 ### Claude Desktop
 
@@ -96,6 +97,28 @@ The `scope` must be one the token is allowed to write (the sample `dev-token` gr
 
 Pass the server via the MCP connector (the `mcp_servers` field), pointing at
 `http://localhost:8000/mcp` with the `Authorization: Bearer <token>` header.
+
+## Project scoping (no trampling)
+
+Memories live in **scopes**, and the server derives each session's scope so a single
+global config can't mix projects together:
+
+1. **Workspace root** — MCP clients (Claude Code included) advertise the project
+   directory as a root; the server maps it to `project:<dirname>-<hash>`. Saves and
+   searches default to this scope automatically. No per-project setup.
+2. **`X-Hypermnesia-Project` header** — override with a stable key (e.g. a repo slug) so
+   a team or several machines share one project's memory. Set it per project in a
+   project-scoped `.mcp.json`.
+3. **`default`** — fallback when a client advertises neither.
+
+`memory_search`/`memory_list` return the current project **plus** any granted shared
+scopes (like `shared`) — never another project's. `memory_save` defaults to the project
+scope; pass `scope: "shared"` to cross boundaries deliberately. Because the scope is
+derived server-side from the real workspace, the model can't accidentally write to the
+wrong project by mistyping a name.
+
+> After changing the server's tool signatures, reconnect the MCP client (it caches the
+> tool list on connect) to pick them up.
 
 ## Local dev
 

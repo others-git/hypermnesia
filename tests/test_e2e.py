@@ -190,6 +190,83 @@ async def test_unauthenticated_call_is_rejected():
     assert "authorization" in msg or "bearer" in msg
 
 
+async def test_projects_do_not_trample_via_roots(tag):
+    """Two sessions with different workspace roots are isolated automatically,
+    with no explicit scope passed — the trampling scenario for a global config."""
+    alpha = [f"file:///workspace/alpha-{tag}"]
+    beta = [f"file:///workspace/beta-{tag}"]
+
+    # Project alpha saves a memory with NO explicit scope.
+    async with make_client(roots=alpha) as a:
+        saved = await a.call_tool(
+            "memory_save",
+            {"content": "alpha-only secret value", "description": f"alpha {tag}",
+             "tags": [tag]},
+        )
+        aid = saved.data["memory"]["id"]
+        assert saved.data["memory"]["scope"].startswith("project:alpha-")
+        # alpha recalls its own memory (no scope passed)
+        hits = (
+            await a.call_tool("memory_search", {"query": "secret value", "tags": [tag]})
+        ).data
+        assert any(h["id"] == aid for h in hits)
+
+    try:
+        # Project beta must NOT see alpha's memory.
+        async with make_client(roots=beta) as b:
+            hits = (
+                await b.call_tool("memory_search", {"query": "secret value", "tags": [tag]})
+            ).data
+            assert all(h["id"] != aid for h in hits)
+            # beta also can't fetch it by id (different project)
+            assert (await b.call_tool("memory_get", {"memory_id": aid})).data is None
+    finally:
+        async with make_client(roots=alpha) as a:
+            await a.call_tool("memory_delete", {"memory_id": aid})
+
+
+async def test_shared_scope_is_visible_across_projects(tag):
+    """Explicit `scope: shared` crosses project boundaries on purpose."""
+    alpha = [f"file:///workspace/alpha-{tag}"]
+    beta = [f"file:///workspace/beta-{tag}"]
+    async with make_client(roots=alpha) as a:
+        saved = await a.call_tool(
+            "memory_save",
+            {"content": "company-wide convention", "description": f"shared {tag}",
+             "scope": "shared", "tags": [tag]},
+        )
+        sid = saved.data["memory"]["id"]
+        assert saved.data["memory"]["scope"] == "shared"
+    try:
+        async with make_client(roots=beta) as b:
+            hits = (
+                await b.call_tool("memory_search", {"query": "convention", "tags": [tag]})
+            ).data
+            assert any(h["id"] == sid for h in hits)
+    finally:
+        async with make_client(roots=alpha) as a:
+            await a.call_tool("memory_delete", {"memory_id": sid})
+
+
+async def test_project_header_override(tag):
+    """The X-Hypermnesia-Project header gives a stable key two clients can share."""
+    key = f"team-{tag}"
+    async with make_client(project_header=key) as a:
+        saved = await a.call_tool(
+            "memory_save",
+            {"content": "team memory", "description": f"team {tag}", "tags": [tag]},
+        )
+        mid = saved.data["memory"]["id"]
+        assert saved.data["memory"]["scope"] == f"project:team-{tag}"
+    try:
+        # a different client using the same header key sees it
+        async with make_client(project_header=key) as b:
+            assert (await b.call_tool("memory_get", {"memory_id": mid})).data is not None
+    finally:
+        async with make_client(project_header=key) as a:
+            await a.call_tool("memory_delete", {"memory_id": mid})
+
+
 async def test_search_only_returns_accessible_scopes(client, tag):
     # Save in an allowed scope, then confirm a disallowed scope filter is refused.
     saved = await _save(client, tag, "scoped memory content", "scoped memory")

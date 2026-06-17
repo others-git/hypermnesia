@@ -3,12 +3,18 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_http_headers
 
-from .auth import AuthError, require_write_scope, resolve_principal, resolve_scopes
+from .auth import (
+    AuthError,
+    effective_read_scopes,
+    effective_write_scope,
+    resolve_principal,
+)
 from .config import Principal, get_settings
+from .scoping import derive_project_scope
 from .service import MemoryService
 
 mcp = FastMCP("hypermnesia")
@@ -35,15 +41,34 @@ def _principal() -> Principal:
         raise ToolError(str(e)) from e
 
 
-def _scopes(principal: Principal, requested: str | None) -> list[str]:
+async def _project_scope(ctx: Context) -> str:
+    """Derive the calling session's project scope from its workspace root.
+
+    Clients (e.g. Claude Code) advertise the project directory as an MCP root;
+    a ``X-Hypermnesia-Project`` header overrides it for stable/shared keys.
+    """
+    headers = get_http_headers(include_all=True)
+    override = headers.get("x-hypermnesia-project")
+    roots: list[str] = []
     try:
-        return resolve_scopes(principal, requested)
+        result = await ctx.list_roots()
+        raw = getattr(result, "roots", result)
+        roots = [str(getattr(r, "uri", r)) for r in raw]
+    except Exception:  # noqa: BLE001 - clients without roots support fall back
+        roots = []
+    return derive_project_scope(roots, override)
+
+
+def _read_scopes(p: Principal, project_scope: str, requested: str | None) -> list[str]:
+    try:
+        return effective_read_scopes(p, project_scope, requested)
     except AuthError as e:
         raise ToolError(str(e)) from e
 
 
 @mcp.tool
 async def memory_search(
+    ctx: Context,
     query: str,
     scope: str | None = None,
     tags: list[str] | None = None,
@@ -51,20 +76,23 @@ async def memory_search(
 ) -> list[dict[str, Any]]:
     """Semantically recall memories relevant to `query`.
 
-    Search this before starting a task. Omit `scope` to search every scope you
-    can access. Returns hits ordered by similarity (0-1).
+    Search this before starting a task. By default searches the current project's
+    memories plus any shared scopes — never another project's. Returns hits
+    ordered by similarity (0-1).
     """
     p = _principal()
+    scopes = _read_scopes(p, await _project_scope(ctx), scope)
     svc = await _get_service()
-    hits = await svc.search(query=query, scopes=_scopes(p, scope), tags=tags, k=k)
+    hits = await svc.search(query=query, scopes=scopes, tags=tags, k=k)
     return [h.model_dump(mode="json") for h in hits]
 
 
 @mcp.tool
 async def memory_save(
+    ctx: Context,
     content: str,
     description: str,
-    scope: str,
+    scope: str | None = None,
     type: str = "fact",
     tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
@@ -72,12 +100,14 @@ async def memory_save(
 ) -> dict[str, Any]:
     """Store a memory. `description` is a one-line summary used for ranking/dedup.
 
-    If a near-duplicate already exists in `scope`, it is updated instead of
-    creating a new row. `type` is one of fact | preference | project | reference.
+    By default the memory is scoped to the current project. Pass `scope: "shared"`
+    to store something useful across projects. If a near-duplicate already exists
+    in the target scope it is updated instead of inserted. `type` is one of
+    fact | preference | project | reference.
     """
     p = _principal()
     try:
-        require_write_scope(p, scope)
+        scope = effective_write_scope(p, await _project_scope(ctx), scope)
     except AuthError as e:
         raise ToolError(str(e)) from e
     svc = await _get_service()
@@ -95,31 +125,37 @@ async def memory_save(
 
 
 @mcp.tool
-async def memory_get(memory_id: str) -> dict[str, Any] | None:
+async def memory_get(ctx: Context, memory_id: str) -> dict[str, Any] | None:
     """Fetch a single memory by id (only if it's in a scope you can access)."""
     p = _principal()
+    scopes = _read_scopes(p, await _project_scope(ctx), None)
     svc = await _get_service()
-    memory = await svc.get(memory_id, _scopes(p, None))
+    memory = await svc.get(memory_id, scopes)
     return memory.model_dump(mode="json") if memory else None
 
 
 @mcp.tool
 async def memory_list(
-    scope: str | None = None, tags: list[str] | None = None, limit: int = 50
+    ctx: Context, scope: str | None = None, tags: list[str] | None = None, limit: int = 50
 ) -> list[dict[str, Any]]:
-    """Browse recent memories (newest first). Use as a cheap index of what's stored."""
+    """Browse recent memories (newest first). Use as a cheap index of what's stored.
+
+    Defaults to the current project plus shared scopes.
+    """
     p = _principal()
+    scopes = _read_scopes(p, await _project_scope(ctx), scope)
     svc = await _get_service()
-    items = await svc.list(_scopes(p, scope), tags=tags, limit=limit)
+    items = await svc.list(scopes, tags=tags, limit=limit)
     return [m.model_dump(mode="json") for m in items]
 
 
 @mcp.tool
-async def memory_delete(memory_id: str) -> dict[str, bool]:
+async def memory_delete(ctx: Context, memory_id: str) -> dict[str, bool]:
     """Delete a memory by id (only if it's in a scope you can access)."""
     p = _principal()
+    scopes = _read_scopes(p, await _project_scope(ctx), None)
     svc = await _get_service()
-    deleted = await svc.delete(memory_id, _scopes(p, None))
+    deleted = await svc.delete(memory_id, scopes)
     return {"deleted": deleted}
 
 

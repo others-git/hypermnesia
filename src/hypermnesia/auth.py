@@ -40,3 +40,40 @@ def resolve_scopes(principal: Principal, requested: str | None) -> list[str]:
 def require_write_scope(principal: Principal, scope: str) -> None:
     if not principal.may_access(scope):
         raise AuthError(f"Principal {principal.id!r} may not write to scope {scope!r}.")
+
+
+# --- project-aware scoping ---------------------------------------------------
+# A session's derived `project_scope` is always implicitly allowed for that
+# caller. `principal.scopes` are *extra* grants (e.g. "shared") on top of it.
+
+
+def effective_read_scopes(
+    principal: Principal, project_scope: str, requested: str | None
+) -> list[str]:
+    """Scopes a search/list reads from.
+
+    Default (no `requested`): the session's project scope plus the principal's
+    extra grants — never another project's scope. An explicit `requested` scope
+    must be the project scope or an extra grant.
+    """
+    if requested is not None:
+        if requested != project_scope and not principal.may_access(requested):
+            raise AuthError(
+                f"Principal {principal.id!r} may not access scope {requested!r}."
+            )
+        return [requested]
+    scopes: list[str] = []
+    for s in (project_scope, *principal.scopes):
+        if s not in scopes:
+            scopes.append(s)
+    return scopes
+
+
+def effective_write_scope(
+    principal: Principal, project_scope: str, requested: str | None
+) -> str:
+    """Scope a save writes to: defaults to the session's project scope."""
+    scope = requested if requested is not None else project_scope
+    if scope != project_scope and not principal.may_access(scope):
+        raise AuthError(f"Principal {principal.id!r} may not write to scope {scope!r}.")
+    return scope
