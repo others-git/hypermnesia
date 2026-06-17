@@ -1,3 +1,8 @@
+# Base stack shared by dev and release. Not run on its own — combine with an overlay:
+#   dev (build from source):  docker compose -f docker-compose.yml -f docker-compose.dev.yml ...
+#   release (pull image):     docker compose -f docker-compose.yml -f docker-compose.release.yml ...
+name: hypermnesia
+
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -16,7 +21,7 @@ services:
       retries: 10
 
   server:
-    build: .
+    image: ghcr.io/others-git/hypermnesia:${HM_TAG:-latest}
     depends_on:
       db:
         condition: service_healthy
@@ -38,9 +43,9 @@ services:
       timeout: 3s
       retries: 10
 
-  # One-shot e2e test runner: `docker compose --profile test run --rm tests`
+  # One-shot e2e test runner: `... --profile test run --rm tests`
   tests:
-    build: .
+    image: ghcr.io/others-git/hypermnesia:${HM_TAG:-latest}
     profiles: ["test"]
     depends_on:
       server:

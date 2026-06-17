@@ -3,7 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+
+env:
+  DEV: -f docker-compose.yml -f docker-compose.dev.yml
 
 jobs:
   test:
@@ -11,16 +15,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build and start the stack
-        run: docker compose up -d --build
+      - name: Build the stack from source
+        run: docker compose $DEV up -d --build
 
       - name: Run the full suite (unit + e2e)
-        run: docker compose --profile test run --rm tests
+        run: docker compose $DEV --profile test run --rm tests
 
       - name: Server logs (on failure)
         if: failure()
-        run: docker compose logs
+        run: docker compose $DEV logs
 
       - name: Tear down
         if: always()
-        run: docker compose down -v
+        run: docker compose $DEV down -v
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # PRs build only (no registry creds); main/tags build and push.
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

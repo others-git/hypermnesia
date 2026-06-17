@@ -1,0 +1,13 @@
+# Release overlay: run the published image, always pulling the chosen tag.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.release.yml up -d
+#   HM_TAG=v0.1.0 docker compose -f docker-compose.yml -f docker-compose.release.yml up -d
+#
+# Defaults to the `latest` tag (see ${HM_TAG} in the base file). The image is
+# published to GHCR by the CI pipeline on pushes to main and on version tags.
+services:
+  server:
+    pull_policy: always
+
+  tests:
+    pull_policy: always

@@ -1,0 +1,15 @@
+# Dev overlay: build the image from local source instead of pulling a release.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile test run --rm tests
+#
+# `build` here also tags the result as the image named in the base file, so the
+# server and tests services share the freshly built image.
+services:
+  server:
+    build: .
+    pull_policy: build
+
+  tests:
+    build: .
+    pull_policy: build
