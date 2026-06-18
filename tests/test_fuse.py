@@ -74,6 +74,15 @@ def test_k_truncates_results():
     assert len(hits) == 3
 
 
+def test_forget_with_no_scopes_is_a_noop():
+    # No accessible scopes -> never touches the pool, returns an empty dry-run.
+    import asyncio
+
+    svc = _svc()
+    res = asyncio.run(svc.forget([], older_than_days=180, importance_floor=1.0))
+    assert res == {"dry_run": True, "scopes": [], "matched": 0, "memories": []}
+
+
 def test_importance_breaks_ties_within_a_rank():
     # Same rank in the same single list -> relevance ties; importance decides.
     svc = _svc()

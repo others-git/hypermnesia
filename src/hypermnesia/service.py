@@ -15,7 +15,7 @@ from .models import Memory, SearchHit
 
 _SELECT_COLS = (
     "id::text, owner_id, scope, type, content, description, tags, metadata, "
-    "importance, created_at, updated_at, last_accessed_at"
+    "importance, created_at, updated_at, last_accessed_at, archived_at"
 )
 
 
@@ -73,7 +73,7 @@ class MemoryService:
                     f"""
                     SELECT {_SELECT_COLS}, 1 - (embedding <=> %s) AS similarity
                     FROM memories
-                    WHERE scope = %s
+                    WHERE scope = %s AND archived_at IS NULL
                     ORDER BY embedding <=> %s
                     LIMIT 1
                     """,
@@ -219,6 +219,7 @@ class MemoryService:
                     SELECT {_SELECT_COLS}, 1 - (embedding <=> %(q)s) AS similarity
                     FROM memories
                     WHERE scope = ANY(%(scopes)s)
+                      AND archived_at IS NULL
                       AND (%(tags)s::text[] IS NULL OR tags && %(tags)s)
                     ORDER BY embedding <=> %(q)s
                     LIMIT %(pool)s
@@ -237,6 +238,7 @@ class MemoryService:
                         SELECT {_SELECT_COLS}, 1 - (embedding <=> %(q)s) AS similarity
                         FROM memories
                         WHERE scope = ANY(%(scopes)s)
+                          AND archived_at IS NULL
                           AND (%(tags)s::text[] IS NULL OR tags && %(tags)s)
                           AND content_tsv @@ websearch_to_tsquery('english', %(query)s)
                         ORDER BY ts_rank_cd(content_tsv,
@@ -261,7 +263,7 @@ class MemoryService:
             row = await (
                 await conn.execute(
                     f"SELECT {_SELECT_COLS} FROM memories "
-                    "WHERE id = %s AND scope = ANY(%s)",
+                    "WHERE id = %s AND scope = ANY(%s) AND archived_at IS NULL",
                     (memory_id, scopes),
                 )
             ).fetchone()
@@ -289,7 +291,7 @@ class MemoryService:
             existing = await (
                 await conn.execute(
                     f"SELECT {_SELECT_COLS} FROM memories "
-                    "WHERE id = %s AND scope = ANY(%s)",
+                    "WHERE id = %s AND scope = ANY(%s) AND archived_at IS NULL",
                     (memory_id, scopes),
                 )
             ).fetchone()
@@ -335,6 +337,7 @@ class MemoryService:
                     f"""
                     SELECT {_SELECT_COLS} FROM memories
                     WHERE scope = ANY(%(scopes)s)
+                      AND archived_at IS NULL
                       AND (%(tags)s::text[] IS NULL OR tags && %(tags)s)
                     ORDER BY updated_at DESC
                     LIMIT %(limit)s
@@ -351,3 +354,70 @@ class MemoryService:
                 (memory_id, scopes),
             )
         return cur.rowcount > 0
+
+    async def forget(
+        self,
+        scopes: list[str],
+        *,
+        tags: list[str] | None = None,
+        older_than_days: float,
+        importance_floor: float,
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        """Archive (soft-delete) stale, low-importance memories.
+
+        A memory is eligible when it hasn't been recalled in ``older_than_days``
+        AND its ``importance`` is at or below ``importance_floor`` — so recall
+        (which bumps ``last_accessed_at``) and a higher importance both protect it.
+        With ``apply=False`` (default) this only reports candidates; with
+        ``apply=True`` it sets ``archived_at`` so they drop out of recall.
+        """
+        empty = {"dry_run": not apply, "scopes": scopes, "matched": 0, "memories": []}
+        if not scopes:
+            return empty
+        where = (
+            "scope = ANY(%(scopes)s) AND archived_at IS NULL "
+            "AND last_accessed_at < now() - (%(days)s::text || ' days')::interval "
+            "AND importance <= %(imp)s "
+            "AND (%(tags)s::text[] IS NULL OR tags && %(tags)s)"
+        )
+        params = {
+            "scopes": scopes,
+            "days": older_than_days,
+            "imp": importance_floor,
+            "tags": tags,
+        }
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            if apply:
+                rows = await (
+                    await conn.execute(
+                        f"UPDATE memories SET archived_at = now() WHERE {where} "
+                        "RETURNING id::text, description, importance, last_accessed_at",
+                        params,
+                    )
+                ).fetchall()
+            else:
+                rows = await (
+                    await conn.execute(
+                        f"SELECT id::text, description, importance, last_accessed_at "
+                        f"FROM memories WHERE {where} ORDER BY last_accessed_at LIMIT 100",
+                        params,
+                    )
+                ).fetchall()
+        return {
+            "dry_run": not apply,
+            "scopes": scopes,
+            "matched": len(rows),
+            "memories": [
+                {
+                    "id": r["id"],
+                    "description": r["description"],
+                    "importance": r["importance"],
+                    "last_accessed_at": r["last_accessed_at"].isoformat()
+                    if r["last_accessed_at"]
+                    else None,
+                }
+                for r in rows
+            ],
+        }

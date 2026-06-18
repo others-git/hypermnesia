@@ -21,7 +21,8 @@ relying on per-session context or hand-edited `CLAUDE.md` files.
 | `memory_update(memory_id, content?, description?, type?, tags?, metadata?, importance?)` | Edit a known memory in place (only given fields change) |
 | `memory_get(memory_id)` | Fetch one by id |
 | `memory_list(scope?, tags?, limit)` | Browse recent memories (cheap index) |
-| `memory_delete(memory_id)` | Delete by id |
+| `memory_delete(memory_id)` | Delete by id (hard) |
+| `memory_forget(scope?, tags?, older_than_days?, importance_floor?, apply?)` | Archive stale, low-importance memories; dry-run unless `apply: true` |
 
 Search results carry both a raw `similarity` (0-1 cosine) and a blended `score` that
 adds recency decay (half-life `HM_RECENCY_HALF_LIFE_DAYS`) and normalised `importance`;
@@ -36,6 +37,14 @@ query are fused with reciprocal-rank fusion, so exact tokens the embedding can't
 capture — error codes, flag names, file paths, names — still surface. A pure keyword
 hit bypasses the similarity floor on purpose. Toggle with `HM_HYBRID_SEARCH`; tune the
 fusion via `HM_RRF_K`, `HM_HYBRID_VECTOR_WEIGHT`, `HM_HYBRID_LEXICAL_WEIGHT`.
+
+**Forgetting.** Stores grow forever and old clutter dilutes recall, so `memory_forget`
+archives memories that are both stale (not recalled in `HM_FORGET_AFTER_DAYS`, default
+180) and unimportant (`importance <=` `HM_FORGET_IMPORTANCE_FLOOR`, default 1.0).
+Recall bumps `last_accessed_at` and a higher `importance` both keep a memory alive, so
+anything you use or pin survives. It's a **soft delete** — archived rows drop out of
+search/get/list but are kept, not destroyed — and a **dry run by default** (pass
+`apply: true` to act). `memory_delete` remains the hard, irreversible removal.
 
 `description` is a one-line summary used for ranking and de-duplication — treat it like
 the one-liners in Claude Code's `MEMORY.md` index.

@@ -61,6 +61,13 @@ class Settings(BaseSettings):
     hybrid_vector_weight: float = 1.0
     hybrid_lexical_weight: float = 1.0
 
+    # --- forgetting ---
+    # Defaults for the memory_forget sweep: a memory is eligible to be archived
+    # once it hasn't been recalled in this many days AND its importance is at or
+    # below the floor. Recall and a higher importance both keep a memory alive.
+    forget_after_days: float = 180.0
+    forget_importance_floor: float = 1.0
+
     # --- server ---
     host: str = "127.0.0.1"
     port: int = 8765

@@ -200,6 +200,45 @@ async def memory_delete(ctx: Context, memory_id: str) -> dict[str, bool]:
     return {"deleted": deleted}
 
 
+@mcp.tool
+async def memory_forget(
+    ctx: Context,
+    scope: str | None = None,
+    tags: list[str] | None = None,
+    older_than_days: float | None = None,
+    importance_floor: float | None = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Archive stale, low-importance memories so old clutter stops diluting recall.
+
+    A memory is eligible when it hasn't been recalled in `older_than_days` AND its
+    `importance` is at or below `importance_floor` — recall and a higher importance
+    both protect it. Archived memories drop out of search/get/list but the rows are
+    kept (recoverable), not hard-deleted.
+
+    Defaults to a **dry run**: it reports what would be archived. Pass `apply: true`
+    to actually archive. Operates over the scopes you can access (optionally narrowed
+    by `tags`).
+    """
+    p = _principal()
+    scopes = _read_scopes(p, await _project_scope(ctx), scope)
+    settings = get_settings()
+    svc = await _get_service()
+    return await svc.forget(
+        scopes,
+        tags=tags,
+        older_than_days=(
+            settings.forget_after_days if older_than_days is None else older_than_days
+        ),
+        importance_floor=(
+            settings.forget_importance_floor
+            if importance_floor is None
+            else importance_floor
+        ),
+        apply=apply,
+    )
+
+
 def main() -> None:
     settings = get_settings()
     mcp.run(transport="http", host=settings.host, port=settings.port)

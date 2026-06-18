@@ -67,6 +67,7 @@ async def test_lists_all_tools(client):
         "memory_list",
         "memory_delete",
         "memory_update",
+        "memory_forget",
     } <= names
 
 
@@ -274,6 +275,62 @@ async def test_update_unknown_id_returns_null(client):
         )
     ).data
     assert res is None
+
+
+async def test_forget_archives_stale_low_importance(client, tag):
+    # low importance -> eligible; high importance -> protected.
+    a = await _save(
+        client, tag, "ephemeral scratch note about a temporary thing",
+        "scratch note", importance=0.5,
+    )
+    b = await _save(
+        client, tag, "a pinned decision we must keep around long term",
+        "pinned decision", importance=5.0,
+    )
+    aid, bid = a["memory"]["id"], b["memory"]["id"]
+    cid = None
+    try:
+        # older_than_days=0 ignores the age gate, isolating the importance gate.
+        forget_args = {
+            "scope": E2E_SCOPE, "tags": [tag],
+            "older_than_days": 0, "importance_floor": 1.0,
+        }
+        # dry run: a is a candidate, b is protected, and nothing is archived yet.
+        dry = (await client.call_tool("memory_forget", forget_args)).data
+        assert dry["dry_run"] is True
+        cand = {m["id"] for m in dry["memories"]}
+        assert aid in cand and bid not in cand
+        assert (await client.call_tool("memory_get", {"memory_id": aid})).data is not None
+
+        # apply: a gets archived.
+        applied = (
+            await client.call_tool("memory_forget", {**forget_args, "apply": True})
+        ).data
+        assert applied["dry_run"] is False
+        assert aid in {m["id"] for m in applied["memories"]}
+
+        # a is now invisible to get/list (and recall); b remains.
+        assert (await client.call_tool("memory_get", {"memory_id": aid})).data is None
+        assert (await client.call_tool("memory_get", {"memory_id": bid})).data is not None
+        listed = {
+            m["id"]
+            for m in (
+                await client.call_tool("memory_list", {"scope": E2E_SCOPE, "tags": [tag]})
+            ).data
+        }
+        assert aid not in listed and bid in listed
+
+        # saving a near-duplicate of the archived note inserts fresh (no revival).
+        c = await _save(
+            client, tag, "ephemeral scratch note about a temporary thing",
+            "scratch note", importance=0.5,
+        )
+        assert c["created"] is True and c["memory"]["id"] != aid
+        cid = c["memory"]["id"]
+    finally:
+        for mid in (aid, bid, cid):
+            if mid:
+                await client.call_tool("memory_delete", {"memory_id": mid})
 
 
 async def test_save_dedupes_near_duplicate(client, tag):

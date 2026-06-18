@@ -19,6 +19,7 @@ class Memory(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
     last_accessed_at: datetime | None = None
+    archived_at: datetime | None = None
 
 
 class SearchHit(Memory):

@@ -96,6 +96,11 @@ async def init_schema(pool: AsyncConnectionPool, dim: int, model_id: str) -> Non
             ) STORED
             """
         )
+        # Soft-delete marker for the forgetting sweep; archived rows are excluded
+        # from recall but kept so a sweep is recoverable. Idempotent for old stores.
+        await conn.execute(
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS archived_at timestamptz"
+        )
         await conn.execute("CREATE INDEX IF NOT EXISTS memories_scope_idx ON memories (scope)")
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS memories_tags_idx ON memories USING gin (tags)"
