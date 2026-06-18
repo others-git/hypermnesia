@@ -16,7 +16,7 @@ relying on per-session context or hand-edited `CLAUDE.md` files.
 
 | Tool | Purpose |
 |---|---|
-| `memory_search(query, scope?, tags?, k, min_similarity?)` | Semantic recall (the workhorse); ranks by similarity + recency + importance |
+| `memory_search(query, scope?, tags?, k, min_similarity?)` | Hybrid (semantic + keyword) recall; ranks by relevance + recency + importance |
 | `memory_save(content, description, scope, type?, tags?, metadata?, importance?)` | Store; updates a near-duplicate instead of inserting |
 | `memory_update(memory_id, content?, description?, type?, tags?, metadata?, importance?)` | Edit a known memory in place (only given fields change) |
 | `memory_get(memory_id)` | Fetch one by id |
@@ -30,6 +30,12 @@ tune the mix via `HM_SCORE_WEIGHT_*`. Hits below `HM_SEARCH_MIN_SIMILARITY`
 `min_similarity` to override per search, or `0.0` to disable. The default is tuned
 for the bge-small-en-v1.5 cosine range (unrelated text scores ~0.30-0.45, relevant
 ~0.55+) — re-tune it if you switch embedding models, since the scale changes.
+
+Search is **hybrid**: a vector (semantic) query and a Postgres full-text (keyword)
+query are fused with reciprocal-rank fusion, so exact tokens the embedding can't
+capture — error codes, flag names, file paths, names — still surface. A pure keyword
+hit bypasses the similarity floor on purpose. Toggle with `HM_HYBRID_SEARCH`; tune the
+fusion via `HM_RRF_K`, `HM_HYBRID_VECTOR_WEIGHT`, `HM_HYBRID_LEXICAL_WEIGHT`.
 
 `description` is a one-line summary used for ranking and de-duplication — treat it like
 the one-liners in Claude Code's `MEMORY.md` index.

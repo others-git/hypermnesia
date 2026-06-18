@@ -85,9 +85,23 @@ async def init_schema(pool: AsyncConnectionPool, dim: int, model_id: str) -> Non
             )
             """
         )
+        # Lexical search column for hybrid (keyword + vector) recall. Generated so
+        # it stays in sync with description/content; ADD COLUMN IF NOT EXISTS
+        # backfills existing stores and is a no-op once present.
+        await conn.execute(
+            """
+            ALTER TABLE memories ADD COLUMN IF NOT EXISTS content_tsv tsvector
+            GENERATED ALWAYS AS (
+                to_tsvector('english', coalesce(description, '') || ' ' || coalesce(content, ''))
+            ) STORED
+            """
+        )
         await conn.execute("CREATE INDEX IF NOT EXISTS memories_scope_idx ON memories (scope)")
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS memories_tags_idx ON memories USING gin (tags)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS memories_tsv_idx ON memories USING gin (content_tsv)"
         )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS memories_embedding_idx "

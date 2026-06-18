@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     # Candidates fetched by vector distance before re-ranking = k * this multiplier.
     rerank_candidate_multiplier: int = 5
 
+    # Hybrid search: fuse semantic (vector) with lexical (Postgres full-text) recall
+    # via reciprocal-rank fusion, so exact tokens (error codes, flag names, paths)
+    # aren't lost to the embedding. The fused relevance then feeds the recency/
+    # importance blend above. A pure-lexical hit bypasses the similarity floor.
+    hybrid_search: bool = True
+    rrf_k: int = 60  # reciprocal-rank-fusion constant; larger = flatter rank weighting
+    hybrid_vector_weight: float = 1.0
+    hybrid_lexical_weight: float = 1.0
+
     # --- server ---
     host: str = "127.0.0.1"
     port: int = 8765

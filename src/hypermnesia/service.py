@@ -118,11 +118,13 @@ class MemoryService:
             ).fetchone()
             return Memory(**row), True, None
 
-    def _rank_score(self, similarity: float, importance: float, last_accessed: datetime | None) -> float:
-        """Blend semantic similarity with recency decay and importance.
+    def _rank_score(self, relevance: float, importance: float, last_accessed: datetime | None) -> float:
+        """Blend a relevance signal with recency decay and importance.
 
-        Recency decays exponentially from ``last_accessed_at`` with the configured
-        half-life; importance is normalised to [0,1] against ``importance_cap``.
+        ``relevance`` is in [0,1]: raw cosine similarity for pure-vector search, or
+        the fused reciprocal-rank score for hybrid search. Recency decays
+        exponentially from ``last_accessed_at`` with the configured half-life;
+        importance is normalised to [0,1] against ``importance_cap``.
         """
         s = self.settings
         if last_accessed is not None:
@@ -133,10 +135,54 @@ class MemoryService:
             recency = 0.0
         imp = min(max(importance, 0.0), s.importance_cap) / s.importance_cap
         return (
-            s.score_weight_similarity * similarity
+            s.score_weight_similarity * relevance
             + s.score_weight_recency * recency
             + s.score_weight_importance * imp
         )
+
+    def _fuse(
+        self,
+        vrows: list[dict[str, Any]],
+        lrows: list[dict[str, Any]],
+        floor: float,
+        k: int,
+    ) -> list[SearchHit]:
+        """Reciprocal-rank-fuse vector + lexical candidates, then blend and rank.
+
+        ``vrows`` are ordered by vector distance, ``lrows`` by lexical rank; each
+        row carries cosine ``similarity``. The similarity floor drops purely
+        semantic candidates, but a lexical match bypasses it (an exact-token hit is
+        intentional relevance, not noise). Returns the top ``k`` SearchHits.
+        """
+        s = self.settings
+        kk = s.rrf_k
+        wv, wl = s.hybrid_vector_weight, s.hybrid_lexical_weight
+        vrank = {r["id"]: i for i, r in enumerate(vrows, 1)}
+        lrank = {r["id"]: i for i, r in enumerate(lrows, 1)}
+        rows_by_id: dict[str, dict[str, Any]] = {}
+        for r in (*vrows, *lrows):
+            rows_by_id.setdefault(r["id"], r)
+        # Normalise fused score to [0,1] against the best possible (rank 1 in every
+        # list that returned anything) so it stays comparable to the blend weights.
+        max_rrf = (wv / (kk + 1) if vrows else 0.0) + (wl / (kk + 1) if lrows else 0.0)
+        if max_rrf == 0.0:
+            return []
+
+        hits: list[SearchHit] = []
+        for mid, row in rows_by_id.items():
+            is_lexical = mid in lrank
+            if not is_lexical and row["similarity"] < floor:
+                continue
+            rrf = 0.0
+            if mid in vrank:
+                rrf += wv / (kk + vrank[mid])
+            if mid in lrank:
+                rrf += wl / (kk + lrank[mid])
+            hit = SearchHit(**row)
+            hit.score = self._rank_score(rrf / max_rrf, hit.importance, hit.last_accessed_at)
+            hits.append(hit)
+        hits.sort(key=lambda h: h.score, reverse=True)
+        return hits[:k]
 
     async def search(
         self,
@@ -154,8 +200,8 @@ class MemoryService:
             if min_similarity is None
             else min_similarity
         )
-        # Pull a wider candidate pool by vector distance, then re-rank in Python so
-        # recency/importance can reorder within the relevant neighbourhood.
+        # Pull a wider candidate pool than k from each signal, then fuse + re-rank
+        # in Python so recency/importance can reorder within the neighbourhood.
         pool = max(k * self.settings.rerank_candidate_multiplier, k)
         vec = Vector(self.embedder.embed_query(query))
         # HNSW post-filters on scope/tags during the index walk, so a filtered
@@ -163,10 +209,11 @@ class MemoryService:
         # (txn-local) so the scan keeps enough candidates to fill it. Capped at the
         # pgvector max of 1000.
         ef_search = min(max(pool * 2, 40), 1000)
+        params = {"q": vec, "scopes": scopes, "tags": tags, "pool": pool, "query": query}
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
             await conn.execute("SELECT set_config('hnsw.ef_search', %s, true)", (str(ef_search),))
-            rows = await (
+            vrows = await (
                 await conn.execute(
                     f"""
                     SELECT {_SELECT_COLS}, 1 - (embedding <=> %(q)s) AS similarity
@@ -176,22 +223,31 @@ class MemoryService:
                     ORDER BY embedding <=> %(q)s
                     LIMIT %(pool)s
                     """,
-                    {"q": vec, "scopes": scopes, "tags": tags, "pool": pool},
+                    params,
                 )
             ).fetchall()
 
-            hits: list[SearchHit] = []
-            for r in rows:
-                if r["similarity"] < floor:
-                    continue
-                hit = SearchHit(**r)
-                hit.score = self._rank_score(
-                    hit.similarity, hit.importance, hit.last_accessed_at
-                )
-                hits.append(hit)
-            hits.sort(key=lambda h: h.score, reverse=True)
-            hits = hits[:k]
+            lrows: list[dict[str, Any]] = []
+            if self.settings.hybrid_search:
+                # websearch_to_tsquery tolerates arbitrary user text (no syntax
+                # errors); an all-stopword query yields no matches -> pure vector.
+                lrows = await (
+                    await conn.execute(
+                        f"""
+                        SELECT {_SELECT_COLS}, 1 - (embedding <=> %(q)s) AS similarity
+                        FROM memories
+                        WHERE scope = ANY(%(scopes)s)
+                          AND (%(tags)s::text[] IS NULL OR tags && %(tags)s)
+                          AND content_tsv @@ websearch_to_tsquery('english', %(query)s)
+                        ORDER BY ts_rank_cd(content_tsv,
+                                 websearch_to_tsquery('english', %(query)s)) DESC
+                        LIMIT %(pool)s
+                        """,
+                        params,
+                    )
+                ).fetchall()
 
+            hits = self._fuse(vrows, lrows, floor, k)
             if hits:
                 await conn.execute(
                     "UPDATE memories SET last_accessed_at = now() WHERE id = ANY(%s)",

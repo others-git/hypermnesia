@@ -179,6 +179,33 @@ async def test_search_returns_blended_score(client, tag):
         await client.call_tool("memory_delete", {"memory_id": saved["memory"]["id"]})
 
 
+async def test_hybrid_surfaces_exact_token_over_floor(client, tag):
+    # A distinctive token embeddings handle poorly, in otherwise unrelated text.
+    saved = await _save(
+        client,
+        tag,
+        "Internal ticket Zxqv9931Q tracks the storage layer rewrite.",
+        "ticket Zxqv9931Q storage rewrite",
+    )
+    try:
+        # An aggressive floor would drop a pure-vector match, but the lexical
+        # (keyword) side bypasses the floor for an exact token hit.
+        hits = (
+            await client.call_tool(
+                "memory_search",
+                {
+                    "query": "Zxqv9931Q",
+                    "scope": E2E_SCOPE,
+                    "tags": [tag],
+                    "min_similarity": 0.9,
+                },
+            )
+        ).data
+        assert any(h["id"] == saved["memory"]["id"] for h in hits)
+    finally:
+        await client.call_tool("memory_delete", {"memory_id": saved["memory"]["id"]})
+
+
 async def test_min_similarity_filters_weak_matches(client, tag):
     saved = await _save(
         client,
