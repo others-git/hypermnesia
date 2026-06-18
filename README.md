@@ -94,10 +94,19 @@ to a `CLAUDE.md` (project-level, or `~/.claude/CLAUDE.md` for all projects):
 
 ```markdown
 ## Persistent memory (hypermnesia MCP)
-- At the start of a task, call `memory_search` for relevant prior context.
+- At the start of a task, call `memory_search` for relevant prior context. Recall is
+  hybrid (semantic + keyword) and ranked by relevance + recency + importance; each hit
+  has a `similarity` and a blended `score`. Pass `min_similarity` to cut weak matches.
 - When you learn a durable fact, preference, or decision, call `memory_save` with a
-  one-line `description` — no `scope` needed; it defaults to this project.
+  one-line `description` — no `scope` needed; it defaults to this project. Set a higher
+  `importance` for things that should stick. If it overwrites a near-duplicate the
+  response includes `replaced` (the pre-merge memory) — check it for a bad merge.
+- To fix or extend a known memory, use `memory_update(memory_id, …)` instead of
+  re-saving; only the fields you pass change.
 - Pass `scope: "shared"` only for things useful across every project.
+- Housekeeping: `memory_forget` archives stale, low-importance memories (dry-run unless
+  `apply: true`); `memory_list(include_archived=true)` reviews them and
+  `memory_restore(memory_id)` brings one back. `memory_delete` is the hard removal.
 - Search before saving; prefer updating a near-duplicate over creating a new memory.
 ```
 
