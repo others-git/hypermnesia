@@ -68,6 +68,7 @@ async def test_lists_all_tools(client):
         "memory_delete",
         "memory_update",
         "memory_forget",
+        "memory_restore",
     } <= names
 
 
@@ -331,6 +332,63 @@ async def test_forget_archives_stale_low_importance(client, tag):
         for mid in (aid, bid, cid):
             if mid:
                 await client.call_tool("memory_delete", {"memory_id": mid})
+
+
+async def test_restore_unarchives_memory(client, tag):
+    saved = await _save(
+        client, tag, "a note that gets forgotten then brought back",
+        "restorable note", importance=0.5,
+    )
+    mid = saved["memory"]["id"]
+    try:
+        # forget it
+        await client.call_tool(
+            "memory_forget",
+            {"scope": E2E_SCOPE, "tags": [tag], "older_than_days": 0,
+             "importance_floor": 1.0, "apply": True},
+        )
+        assert (await client.call_tool("memory_get", {"memory_id": mid})).data is None
+
+        # it's hidden from a normal list but visible with include_archived
+        plain = {
+            m["id"]
+            for m in (
+                await client.call_tool("memory_list", {"scope": E2E_SCOPE, "tags": [tag]})
+            ).data
+        }
+        assert mid not in plain
+        archived = (
+            await client.call_tool(
+                "memory_list",
+                {"scope": E2E_SCOPE, "tags": [tag], "include_archived": True},
+            )
+        ).data
+        entry = next(m for m in archived if m["id"] == mid)
+        assert entry["archived_at"] is not None
+
+        # restore brings it back and clears archived_at
+        restored = (await client.call_tool("memory_restore", {"memory_id": mid})).data
+        assert restored["id"] == mid and restored["archived_at"] is None
+        assert (await client.call_tool("memory_get", {"memory_id": mid})).data is not None
+
+        # restore refreshed last_accessed_at, so a realistic sweep won't re-archive it
+        dry = (
+            await client.call_tool(
+                "memory_forget",
+                {"scope": E2E_SCOPE, "tags": [tag], "older_than_days": 1,
+                 "importance_floor": 1.0},
+            )
+        ).data
+        assert mid not in {m["id"] for m in dry["memories"]}
+    finally:
+        await client.call_tool("memory_delete", {"memory_id": mid})
+
+
+async def test_restore_unknown_id_returns_null(client):
+    res = (
+        await client.call_tool("memory_restore", {"memory_id": str(uuid.uuid4())})
+    ).data
+    assert res is None
 
 
 async def test_save_dedupes_near_duplicate(client, tag):

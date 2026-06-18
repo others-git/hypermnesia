@@ -326,10 +326,15 @@ class MemoryService:
         return Memory(**row)
 
     async def list(
-        self, scopes: list[str], tags: list[str] | None = None, limit: int = 50
+        self,
+        scopes: list[str],
+        tags: list[str] | None = None,
+        limit: int = 50,
+        include_archived: bool = False,
     ) -> list[Memory]:
         if not scopes:
             return []
+        archived_clause = "" if include_archived else "AND archived_at IS NULL"
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
             rows = await (
@@ -337,7 +342,7 @@ class MemoryService:
                     f"""
                     SELECT {_SELECT_COLS} FROM memories
                     WHERE scope = ANY(%(scopes)s)
-                      AND archived_at IS NULL
+                      {archived_clause}
                       AND (%(tags)s::text[] IS NULL OR tags && %(tags)s)
                     ORDER BY updated_at DESC
                     LIMIT %(limit)s
@@ -346,6 +351,28 @@ class MemoryService:
                 )
             ).fetchall()
         return [Memory(**r) for r in rows]
+
+    async def restore(self, memory_id: str, scopes: list[str]) -> Memory | None:
+        """Un-archive a forgotten memory so it returns to recall.
+
+        Clears ``archived_at`` and refreshes ``last_accessed_at`` (a restore counts
+        as a touch, so the next forget sweep won't immediately re-archive it).
+        Idempotent on an already-active memory. Returns None if not found.
+        """
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            row = await (
+                await conn.execute(
+                    f"""
+                    UPDATE memories
+                    SET archived_at = NULL, last_accessed_at = now()
+                    WHERE id = %s AND scope = ANY(%s)
+                    RETURNING {_SELECT_COLS}
+                    """,
+                    (memory_id, scopes),
+                )
+            ).fetchone()
+        return Memory(**row) if row else None
 
     async def delete(self, memory_id: str, scopes: list[str]) -> bool:
         async with self.pool.connection() as conn:

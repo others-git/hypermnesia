@@ -177,17 +177,38 @@ async def memory_update(
 
 @mcp.tool
 async def memory_list(
-    ctx: Context, scope: str | None = None, tags: list[str] | None = None, limit: int = 50
+    ctx: Context,
+    scope: str | None = None,
+    tags: list[str] | None = None,
+    limit: int = 50,
+    include_archived: bool = False,
 ) -> list[dict[str, Any]]:
     """Browse recent memories (newest first). Use as a cheap index of what's stored.
 
-    Defaults to the current project plus shared scopes.
+    Defaults to the current project plus shared scopes, and hides archived
+    (forgotten) memories. Pass `include_archived: true` to review what was archived
+    (an `archived_at` timestamp is set on those) — e.g. before restoring one.
     """
     p = _principal()
     scopes = _read_scopes(p, await _project_scope(ctx), scope)
     svc = await _get_service()
-    items = await svc.list(scopes, tags=tags, limit=limit)
+    items = await svc.list(scopes, tags=tags, limit=limit, include_archived=include_archived)
     return [m.model_dump(mode="json") for m in items]
+
+
+@mcp.tool
+async def memory_restore(ctx: Context, memory_id: str) -> dict[str, Any] | None:
+    """Un-archive a forgotten memory so it shows up in recall again.
+
+    The inverse of `memory_forget`. Find archived ids via
+    `memory_list(include_archived=true)`. Returns the restored memory, or null if
+    not found in a scope you can access.
+    """
+    p = _principal()
+    scopes = _read_scopes(p, await _project_scope(ctx), None)
+    svc = await _get_service()
+    memory = await svc.restore(memory_id, scopes)
+    return memory.model_dump(mode="json") if memory else None
 
 
 @mcp.tool
