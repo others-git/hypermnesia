@@ -66,6 +66,7 @@ async def test_lists_all_tools(client):
         "memory_get",
         "memory_list",
         "memory_delete",
+        "memory_update",
     } <= names
 
 
@@ -138,6 +139,7 @@ async def test_semantic_recall_ranks_relevant_first(client, tag):
                     "scope": E2E_SCOPE,
                     "tags": [tag],
                     "k": 2,
+                    "min_similarity": 0.0,  # independent of the configured floor
                 },
             )
         ).data
@@ -149,6 +151,102 @@ async def test_semantic_recall_ranks_relevant_first(client, tag):
     finally:
         for mid in ids:
             await client.call_tool("memory_delete", {"memory_id": mid})
+
+
+async def test_search_returns_blended_score(client, tag):
+    saved = await _save(
+        client,
+        tag,
+        "The user wants embeddings to run locally on CPU.",
+        "local CPU embeddings",
+    )
+    try:
+        hits = (
+            await client.call_tool(
+                "memory_search",
+                {"query": "where do embeddings run?", "scope": E2E_SCOPE, "tags": [tag]},
+            )
+        ).data
+        assert hits
+        h = hits[0]
+        # both raw similarity and the blended rank score are exposed
+        assert 0.0 <= h["similarity"] <= 1.0
+        assert h["score"] >= h["similarity"]  # recency+importance only add
+        # results are ordered by the blended score, descending
+        scores = [x["score"] for x in hits]
+        assert scores == sorted(scores, reverse=True)
+    finally:
+        await client.call_tool("memory_delete", {"memory_id": saved["memory"]["id"]})
+
+
+async def test_min_similarity_filters_weak_matches(client, tag):
+    saved = await _save(
+        client,
+        tag,
+        "Postgres connection pooling settings for the service.",
+        "pg connection pooling",
+    )
+    try:
+        # An unrelated query with an aggressive floor should return nothing.
+        hits = (
+            await client.call_tool(
+                "memory_search",
+                {
+                    "query": "favourite pizza toppings",
+                    "scope": E2E_SCOPE,
+                    "tags": [tag],
+                    "min_similarity": 0.95,
+                },
+            )
+        ).data
+        assert hits == []
+    finally:
+        await client.call_tool("memory_delete", {"memory_id": saved["memory"]["id"]})
+
+
+async def test_update_changes_only_given_fields(client, tag):
+    saved = await _save(
+        client,
+        tag,
+        "Original content about deployment.",
+        "deployment note",
+        type="fact",
+        importance=1.0,
+    )
+    mid = saved["memory"]["id"]
+    try:
+        updated = (
+            await client.call_tool(
+                "memory_update",
+                {"memory_id": mid, "importance": 3.0, "type": "project"},
+            )
+        ).data
+        assert updated["id"] == mid
+        assert updated["importance"] == 3.0
+        assert updated["type"] == "project"
+        # untouched fields are preserved
+        assert updated["content"] == "Original content about deployment."
+        assert tag in updated["tags"]
+
+        # content edit re-embeds and is retrievable by its new meaning
+        edited = (
+            await client.call_tool(
+                "memory_update",
+                {"memory_id": mid, "content": "Now about caching strategy instead."},
+            )
+        ).data
+        assert edited["content"] == "Now about caching strategy instead."
+    finally:
+        await client.call_tool("memory_delete", {"memory_id": mid})
+
+
+async def test_update_unknown_id_returns_null(client):
+    res = (
+        await client.call_tool(
+            "memory_update", {"memory_id": str(uuid.uuid4()), "importance": 2.0}
+        )
+    ).data
+    assert res is None
 
 
 async def test_save_dedupes_near_duplicate(client, tag):
@@ -169,6 +267,11 @@ async def test_save_dedupes_near_duplicate(client, tag):
         # near-duplicate within the same scope updates instead of inserting
         assert b["created"] is False
         assert b["memory"]["id"] == a["memory"]["id"]
+        # the pre-merge memory is surfaced so a bad overwrite is catchable
+        assert b["replaced"]["id"] == a["memory"]["id"]
+        assert b["replaced"]["content"] == a["memory"]["content"]
+        # a fresh insert reports no replacement
+        assert "replaced" not in a
     finally:
         await client.call_tool("memory_delete", {"memory_id": a["memory"]["id"]})
 

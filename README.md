@@ -16,11 +16,20 @@ relying on per-session context or hand-edited `CLAUDE.md` files.
 
 | Tool | Purpose |
 |---|---|
-| `memory_search(query, scope?, tags?, k)` | Semantic recall (the workhorse) |
+| `memory_search(query, scope?, tags?, k, min_similarity?)` | Semantic recall (the workhorse); ranks by similarity + recency + importance |
 | `memory_save(content, description, scope, type?, tags?, metadata?, importance?)` | Store; updates a near-duplicate instead of inserting |
+| `memory_update(memory_id, content?, description?, type?, tags?, metadata?, importance?)` | Edit a known memory in place (only given fields change) |
 | `memory_get(memory_id)` | Fetch one by id |
 | `memory_list(scope?, tags?, limit)` | Browse recent memories (cheap index) |
 | `memory_delete(memory_id)` | Delete by id |
+
+Search results carry both a raw `similarity` (0-1 cosine) and a blended `score` that
+adds recency decay (half-life `HM_RECENCY_HALF_LIFE_DAYS`) and normalised `importance`;
+tune the mix via `HM_SCORE_WEIGHT_*`. Hits below `HM_SEARCH_MIN_SIMILARITY`
+(default `0.4`) are dropped before they reach the agent's context; pass
+`min_similarity` to override per search, or `0.0` to disable. The default is tuned
+for the bge-small-en-v1.5 cosine range (unrelated text scores ~0.30-0.45, relevant
+~0.55+) — re-tune it if you switch embedding models, since the scale changes.
 
 `description` is a one-line summary used for ranking and de-duplication — treat it like
 the one-liners in Claude Code's `MEMORY.md` index.

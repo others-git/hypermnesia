@@ -22,4 +22,5 @@ class Memory(BaseModel):
 
 
 class SearchHit(Memory):
-    similarity: float
+    similarity: float  # raw cosine similarity to the query, [0,1]
+    score: float = 0.0  # blended relevance+recency+importance rank score

@@ -73,17 +73,21 @@ async def memory_search(
     scope: str | None = None,
     tags: list[str] | None = None,
     k: int = 8,
+    min_similarity: float | None = None,
 ) -> list[dict[str, Any]]:
     """Semantically recall memories relevant to `query`.
 
     Search this before starting a task. By default searches the current project's
-    memories plus any shared scopes — never another project's. Returns hits
-    ordered by similarity (0-1).
+    memories plus any shared scopes — never another project's. Results are ranked
+    by a blend of semantic `similarity` (0-1), recency, and importance, exposed as
+    `score`. Pass `min_similarity` (e.g. 0.3) to drop weak matches.
     """
     p = _principal()
     scopes = _read_scopes(p, await _project_scope(ctx), scope)
     svc = await _get_service()
-    hits = await svc.search(query=query, scopes=scopes, tags=tags, k=k)
+    hits = await svc.search(
+        query=query, scopes=scopes, tags=tags, k=k, min_similarity=min_similarity
+    )
     return [h.model_dump(mode="json") for h in hits]
 
 
@@ -102,8 +106,9 @@ async def memory_save(
 
     By default the memory is scoped to the current project. Pass `scope: "shared"`
     to store something useful across projects. If a near-duplicate already exists
-    in the target scope it is updated instead of inserted. `type` is one of
-    fact | preference | project | reference.
+    in the target scope it is updated instead of inserted (`created: false`), and
+    `replaced` holds what that memory looked like before the merge — check it to
+    catch a wrong overwrite. `type` is one of fact | preference | project | reference.
     """
     p = _principal()
     try:
@@ -111,7 +116,7 @@ async def memory_save(
     except AuthError as e:
         raise ToolError(str(e)) from e
     svc = await _get_service()
-    memory, created = await svc.save(
+    memory, created, replaced = await svc.save(
         owner_id=p.id,
         scope=scope,
         content=content,
@@ -121,7 +126,10 @@ async def memory_save(
         metadata=metadata,
         importance=importance,
     )
-    return {"created": created, "memory": memory.model_dump(mode="json")}
+    out: dict[str, Any] = {"created": created, "memory": memory.model_dump(mode="json")}
+    if replaced is not None:
+        out["replaced"] = replaced.model_dump(mode="json")
+    return out
 
 
 @mcp.tool
@@ -131,6 +139,39 @@ async def memory_get(ctx: Context, memory_id: str) -> dict[str, Any] | None:
     scopes = _read_scopes(p, await _project_scope(ctx), None)
     svc = await _get_service()
     memory = await svc.get(memory_id, scopes)
+    return memory.model_dump(mode="json") if memory else None
+
+
+@mcp.tool
+async def memory_update(
+    ctx: Context,
+    memory_id: str,
+    content: str | None = None,
+    description: str | None = None,
+    type: str | None = None,
+    tags: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+    importance: float | None = None,
+) -> dict[str, Any] | None:
+    """Edit an existing memory by id (only if it's in a scope you can access).
+
+    Only the fields you pass are changed; the rest are preserved. Use this to fix
+    or extend a known memory, retag it, or adjust its `importance` — instead of
+    re-saving and relying on dedup. Returns the updated memory, or null if not found.
+    """
+    p = _principal()
+    scopes = _read_scopes(p, await _project_scope(ctx), None)
+    svc = await _get_service()
+    memory = await svc.update(
+        memory_id,
+        scopes,
+        content=content,
+        description=description,
+        type=type,
+        tags=tags,
+        metadata=metadata,
+        importance=importance,
+    )
     return memory.model_dump(mode="json") if memory else None
 
 

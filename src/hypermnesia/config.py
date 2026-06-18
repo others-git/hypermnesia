@@ -34,6 +34,24 @@ class Settings(BaseSettings):
     dedupe_threshold: float = 0.92  # cosine sim above which save() updates the near-duplicate
     default_top_k: int = 8
 
+    # Drop hits below this cosine similarity so weak matches don't pollute recall.
+    # Tuned for bge-small-en-v1.5, whose cosine range is compressed: unrelated text
+    # sits ~0.30-0.45 and relevant hits ~0.55+, so 0.4 trims clear noise while
+    # keeping loosely-related memories (missing recall is worse than a weak hit).
+    # Re-tune if you change embedding models. 0.0 disables; callers override per-search.
+    search_min_similarity: float = 0.4
+
+    # Final ranking blends semantic similarity with recency and importance
+    # (generative-agents style): score = w_sim*sim + w_recency*recency + w_importance*imp.
+    # similarity dominates by default so relevance still leads.
+    score_weight_similarity: float = 1.0
+    score_weight_recency: float = 0.25
+    score_weight_importance: float = 0.15
+    recency_half_life_days: float = 30.0  # last_accessed_at decay half-life
+    importance_cap: float = 2.0  # importance is normalised to [0,1] against this cap
+    # Candidates fetched by vector distance before re-ranking = k * this multiplier.
+    rerank_candidate_multiplier: int = 5
+
     # --- server ---
     host: str = "127.0.0.1"
     port: int = 8765
