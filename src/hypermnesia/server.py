@@ -86,7 +86,8 @@ async def memory_search(
     scopes = _read_scopes(p, await _project_scope(ctx), scope)
     svc = await _get_service()
     hits = await svc.search(
-        query=query, scopes=scopes, tags=tags, k=k, min_similarity=min_similarity
+        query=query, scopes=scopes, tags=tags, k=k, min_similarity=min_similarity,
+        owner_id=p.id,
     )
     return [h.model_dump(mode="json") for h in hits]
 
@@ -222,6 +223,26 @@ async def memory_delete(ctx: Context, memory_id: str) -> dict[str, bool]:
 
 
 @mcp.tool
+async def memory_stats(
+    ctx: Context,
+    scope: str | None = None,
+    days: float = 30.0,
+) -> dict[str, Any]:
+    """Recall health check: store size per scope + search-quality metrics.
+
+    Reports active/archived memory counts for the scopes you can access, and —
+    from the search log — search volume, empty-result rate, average hits and top
+    score, and latency percentiles over the last `days`, plus the most recent
+    queries that returned nothing (recall misses worth investigating). Use it to
+    judge whether recall is healthy and to tune `min_similarity` from evidence.
+    """
+    p = _principal()
+    scopes = _read_scopes(p, await _project_scope(ctx), scope)
+    svc = await _get_service()
+    return await svc.stats(scopes, days=days)
+
+
+@mcp.tool
 async def memory_forget(
     ctx: Context,
     scope: str | None = None,
@@ -229,6 +250,7 @@ async def memory_forget(
     older_than_days: float | None = None,
     importance_floor: float | None = None,
     apply: bool = False,
+    limit: int = 100,
 ) -> dict[str, Any]:
     """Archive stale, low-importance memories so old clutter stops diluting recall.
 
@@ -239,7 +261,9 @@ async def memory_forget(
 
     Defaults to a **dry run**: it reports what would be archived. Pass `apply: true`
     to actually archive. Operates over the scopes you can access (optionally narrowed
-    by `tags`).
+    by `tags`). `matched` is the true total the criteria hit — exactly what apply
+    would archive — while `memories` lists at most `limit` of them (stalest first;
+    `truncated` is set when the list was cut).
     """
     p = _principal()
     scopes = _read_scopes(p, await _project_scope(ctx), scope)
@@ -257,6 +281,7 @@ async def memory_forget(
             else importance_floor
         ),
         apply=apply,
+        limit=limit,
     )
 
 

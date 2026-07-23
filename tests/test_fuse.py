@@ -80,7 +80,21 @@ def test_forget_with_no_scopes_is_a_noop():
 
     svc = _svc()
     res = asyncio.run(svc.forget([], older_than_days=180, importance_floor=1.0))
-    assert res == {"dry_run": True, "scopes": [], "matched": 0, "memories": []}
+    assert res == {
+        "dry_run": True, "scopes": [], "matched": 0,
+        "truncated": False, "memories": [],
+    }
+
+
+def test_stats_with_no_scopes_is_a_noop():
+    # No accessible scopes -> never touches the pool, returns zeroed stats.
+    import asyncio
+
+    svc = _svc()
+    res = asyncio.run(svc.stats([]))
+    assert res["memories"] == {"active": 0, "archived": 0, "by_scope": []}
+    assert res["searches"]["total"] == 0 and res["searches"]["empty_rate"] == 0.0
+    assert res["recent_empty_queries"] == []
 
 
 def test_importance_breaks_ties_within_a_rank():

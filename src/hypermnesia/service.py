@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -40,8 +42,18 @@ class MemoryService:
     async def aclose(self) -> None:
         await self.pool.close()
 
-    def _embed_record(self, description: str, content: str) -> Vector:
-        return Vector(self.embedder.embed_documents([f"{description}\n\n{content}"])[0])
+    # Embedders are synchronous (CPU-bound ONNX inference or a blocking HTTP
+    # call), so they run in a worker thread — otherwise one embed stalls every
+    # concurrent request on the event loop.
+
+    async def _embed_record(self, description: str, content: str) -> Vector:
+        vecs = await asyncio.to_thread(
+            self.embedder.embed_documents, [f"{description}\n\n{content}"]
+        )
+        return Vector(vecs[0])
+
+    async def _embed_query(self, query: str) -> Vector:
+        return Vector(await asyncio.to_thread(self.embedder.embed_query, query))
 
     async def save(
         self,
@@ -64,7 +76,7 @@ class MemoryService:
         """
         tags = tags or []
         metadata = metadata or {}
-        vec = self._embed_record(description, content)
+        vec = await self._embed_record(description, content)
 
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
@@ -192,9 +204,11 @@ class MemoryService:
         tags: list[str] | None = None,
         k: int = 8,
         min_similarity: float | None = None,
+        owner_id: str | None = None,
     ) -> list[SearchHit]:
         if not scopes:
             return []
+        started = time.perf_counter()
         floor = (
             self.settings.search_min_similarity
             if min_similarity is None
@@ -203,7 +217,7 @@ class MemoryService:
         # Pull a wider candidate pool than k from each signal, then fuse + re-rank
         # in Python so recency/importance can reorder within the neighbourhood.
         pool = max(k * self.settings.rerank_candidate_multiplier, k)
-        vec = Vector(self.embedder.embed_query(query))
+        vec = await self._embed_query(query)
         # HNSW post-filters on scope/tags during the index walk, so a filtered
         # search can return fewer than `pool` rows. Widen ef_search past the pool
         # (txn-local) so the scan keeps enough candidates to fill it. Capped at the
@@ -254,6 +268,23 @@ class MemoryService:
                 await conn.execute(
                     "UPDATE memories SET last_accessed_at = now() WHERE id = ANY(%s)",
                     ([h.id for h in hits],),
+                )
+            if self.settings.search_log_enabled:
+                await conn.execute(
+                    """
+                    INSERT INTO search_log
+                        (owner_id, scopes, query, k, min_similarity,
+                         vector_candidates, lexical_candidates,
+                         hit_count, top_score, top_similarity, latency_ms)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        owner_id, scopes, query, k, floor,
+                        len(vrows), len(lrows), len(hits),
+                        hits[0].score if hits else None,
+                        max((h.similarity for h in hits), default=None),
+                        (time.perf_counter() - started) * 1000.0,
+                    ),
                 )
         return hits
 
@@ -309,7 +340,7 @@ class MemoryService:
                 "importance": existing["importance"] if importance is None else importance,
             }
             if content is not None or description is not None:
-                sets["embedding"] = self._embed_record(new_description, new_content)
+                sets["embedding"] = await self._embed_record(new_description, new_content)
                 sets["model_id"] = self.embedder.model_id
 
             assignments = ", ".join(f"{col} = %s" for col in sets)
@@ -382,6 +413,101 @@ class MemoryService:
             )
         return cur.rowcount > 0
 
+    async def stats(self, scopes: list[str], days: float = 30.0) -> dict[str, Any]:
+        """Aggregate store size and recall quality over the accessible scopes.
+
+        Memory counts come from the store itself; search metrics (volume, empty
+        rate, score/latency distribution, recent misses) come from search_log
+        rows within the last ``days`` whose scope set overlaps ``scopes``.
+        """
+        empty_searches = {
+            "window_days": days, "total": 0, "empty": 0, "empty_rate": 0.0,
+            "avg_hits": None, "avg_top_score": None,
+            "p50_latency_ms": None, "p95_latency_ms": None,
+        }
+        if not scopes:
+            return {
+                "scopes": [],
+                "memories": {"active": 0, "archived": 0, "by_scope": []},
+                "searches": empty_searches,
+                "recent_empty_queries": [],
+            }
+        async with self.pool.connection() as conn:
+            conn.row_factory = dict_row
+            by_scope = await (
+                await conn.execute(
+                    """
+                    SELECT scope,
+                           count(*) FILTER (WHERE archived_at IS NULL)::int AS active,
+                           count(*) FILTER (WHERE archived_at IS NOT NULL)::int AS archived
+                    FROM memories WHERE scope = ANY(%s)
+                    GROUP BY scope ORDER BY scope
+                    """,
+                    (scopes,),
+                )
+            ).fetchall()
+
+            window = (
+                "scopes && %(scopes)s "
+                "AND created_at > now() - (%(days)s::text || ' days')::interval"
+            )
+            params = {"scopes": scopes, "days": days}
+            agg = await (
+                await conn.execute(
+                    f"""
+                    SELECT count(*)::int AS total,
+                           count(*) FILTER (WHERE hit_count = 0)::int AS empty,
+                           avg(hit_count) AS avg_hits,
+                           avg(top_score) AS avg_top_score,
+                           percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms)
+                               AS p50_latency_ms,
+                           percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)
+                               AS p95_latency_ms
+                    FROM search_log WHERE {window}
+                    """,
+                    params,
+                )
+            ).fetchone()
+            misses = await (
+                await conn.execute(
+                    f"""
+                    SELECT query, created_at FROM search_log
+                    WHERE hit_count = 0 AND {window}
+                    ORDER BY created_at DESC LIMIT 10
+                    """,
+                    params,
+                )
+            ).fetchall()
+
+        searches = empty_searches
+        if agg["total"]:
+            searches = {
+                "window_days": days,
+                "total": agg["total"],
+                "empty": agg["empty"],
+                "empty_rate": round(agg["empty"] / agg["total"], 3),
+                "avg_hits": round(float(agg["avg_hits"]), 2),
+                "avg_top_score": (
+                    round(float(agg["avg_top_score"]), 3)
+                    if agg["avg_top_score"] is not None
+                    else None
+                ),
+                "p50_latency_ms": round(float(agg["p50_latency_ms"]), 1),
+                "p95_latency_ms": round(float(agg["p95_latency_ms"]), 1),
+            }
+        return {
+            "scopes": scopes,
+            "memories": {
+                "active": sum(r["active"] for r in by_scope),
+                "archived": sum(r["archived"] for r in by_scope),
+                "by_scope": by_scope,
+            },
+            "searches": searches,
+            "recent_empty_queries": [
+                {"query": m["query"], "at": m["created_at"].isoformat()} for m in misses
+            ],
+        }
+
     async def forget(
         self,
         scopes: list[str],
@@ -390,6 +516,7 @@ class MemoryService:
         older_than_days: float,
         importance_floor: float,
         apply: bool = False,
+        limit: int = 100,
     ) -> dict[str, Any]:
         """Archive (soft-delete) stale, low-importance memories.
 
@@ -398,8 +525,19 @@ class MemoryService:
         (which bumps ``last_accessed_at``) and a higher importance both protect it.
         With ``apply=False`` (default) this only reports candidates; with
         ``apply=True`` it sets ``archived_at`` so they drop out of recall.
+
+        ``matched`` is always the TRUE total the criteria hit — the same number
+        apply would archive — while ``memories`` lists at most ``limit`` of them
+        (stalest first, ``truncated`` flags the cut), so a dry run can't
+        under-report what an apply will do.
         """
-        empty = {"dry_run": not apply, "scopes": scopes, "matched": 0, "memories": []}
+        empty = {
+            "dry_run": not apply,
+            "scopes": scopes,
+            "matched": 0,
+            "truncated": False,
+            "memories": [],
+        }
         if not scopes:
             return empty
         where = (
@@ -424,18 +562,30 @@ class MemoryService:
                         params,
                     )
                 ).fetchall()
+                rows.sort(key=lambda r: r["last_accessed_at"])
+                matched = len(rows)
+                rows = rows[:limit]
             else:
+                matched = (
+                    await (
+                        await conn.execute(
+                            f"SELECT count(*) AS n FROM memories WHERE {where}", params
+                        )
+                    ).fetchone()
+                )["n"]
                 rows = await (
                     await conn.execute(
                         f"SELECT id::text, description, importance, last_accessed_at "
-                        f"FROM memories WHERE {where} ORDER BY last_accessed_at LIMIT 100",
-                        params,
+                        f"FROM memories WHERE {where} ORDER BY last_accessed_at "
+                        "LIMIT %(limit)s",
+                        {**params, "limit": limit},
                     )
                 ).fetchall()
         return {
             "dry_run": not apply,
             "scopes": scopes,
-            "matched": len(rows),
+            "matched": matched,
+            "truncated": matched > len(rows),
             "memories": [
                 {
                     "id": r["id"],

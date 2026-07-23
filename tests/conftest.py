@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 
-import pytest
-
 E2E_URL = os.environ.get("HM_TEST_URL", "http://localhost:8765/mcp")
 E2E_TOKEN = os.environ.get("HM_TEST_TOKEN", "dev-token")
 E2E_SCOPE = os.environ.get("HM_TEST_SCOPE", "user:dev-test")

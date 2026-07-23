@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     hybrid_vector_weight: float = 1.0
     hybrid_lexical_weight: float = 1.0
 
+    # --- observability ---
+    # Log every memory_search (query, candidate/hit counts, top scores, latency)
+    # to the search_log table; memory_stats aggregates it. Cheap (one insert per
+    # search) but queries land in the DB — disable if that's unwanted.
+    search_log_enabled: bool = True
+
     # --- forgetting ---
     # Defaults for the memory_forget sweep: a memory is eligible to be archived
     # once it hasn't been recalled in this many days AND its importance is at or

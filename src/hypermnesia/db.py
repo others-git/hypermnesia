@@ -112,6 +112,34 @@ async def init_schema(pool: AsyncConnectionPool, dim: int, model_id: str) -> Non
             "CREATE INDEX IF NOT EXISTS memories_embedding_idx "
             "ON memories USING hnsw (embedding vector_cosine_ops)"
         )
+        # Recall observability: one row per memory_search call, so the ranking
+        # knobs (similarity floor, blend weights) can be tuned from evidence
+        # instead of feel, and recall misses (empty searches) are visible.
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_log (
+                id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                owner_id text,
+                scopes text[] NOT NULL,
+                query text NOT NULL,
+                k int NOT NULL,
+                min_similarity real,
+                vector_candidates int NOT NULL,
+                lexical_candidates int NOT NULL,
+                hit_count int NOT NULL,
+                top_score real,
+                top_similarity real,
+                latency_ms real NOT NULL
+            )
+            """
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS search_log_created_idx ON search_log (created_at)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS search_log_scopes_idx ON search_log USING gin (scopes)"
+        )
         await conn.execute(
             """
             INSERT INTO hm_meta (key, value) VALUES ('embedding_dim', %s), ('model_id', %s)

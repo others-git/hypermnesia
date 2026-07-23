@@ -69,6 +69,7 @@ async def test_lists_all_tools(client):
         "memory_update",
         "memory_forget",
         "memory_restore",
+        "memory_stats",
     } <= names
 
 
@@ -334,6 +335,50 @@ async def test_forget_archives_stale_low_importance(client, tag):
                 await client.call_tool("memory_delete", {"memory_id": mid})
 
 
+async def test_forget_matched_reports_true_total_beyond_limit(client, tag):
+    """A dry run must never under-report what an apply would archive: `matched`
+    is the true total even when `memories` is cut to `limit`."""
+    # Distinct topics, or the server's own dedup would merge them on save.
+    notes = [
+        ("staging runs kubernetes 1.29 on three nodes", "staging k8s version"),
+        ("the marketing site is built with a static generator", "marketing site stack"),
+        ("friday lunch orders go to the taco place", "friday lunch spot"),
+    ]
+    ids = []
+    try:
+        for content, description in notes:
+            saved = await _save(client, tag, content, description, importance=0.5)
+            assert saved["created"] is True
+            ids.append(saved["memory"]["id"])
+
+        forget_args = {
+            "scope": E2E_SCOPE, "tags": [tag],
+            "older_than_days": 0, "importance_floor": 1.0, "limit": 2,
+        }
+        dry = (await client.call_tool("memory_forget", forget_args)).data
+        assert dry["dry_run"] is True
+        assert dry["matched"] == 3
+        assert len(dry["memories"]) == 2
+        assert dry["truncated"] is True
+
+        # apply archives everything matched, not just the listed sample
+        applied = (
+            await client.call_tool("memory_forget", {**forget_args, "apply": True})
+        ).data
+        assert applied["matched"] == 3
+        assert len(applied["memories"]) == 2
+        assert applied["truncated"] is True
+        for mid in ids:
+            assert (await client.call_tool("memory_get", {"memory_id": mid})).data is None
+
+        # nothing left: an un-truncated empty report
+        again = (await client.call_tool("memory_forget", forget_args)).data
+        assert again["matched"] == 0 and again["truncated"] is False
+    finally:
+        for mid in ids:
+            await client.call_tool("memory_delete", {"memory_id": mid})
+
+
 async def test_restore_unarchives_memory(client, tag):
     saved = await _save(
         client, tag, "a note that gets forgotten then brought back",
@@ -389,6 +434,56 @@ async def test_restore_unknown_id_returns_null(client):
         await client.call_tool("memory_restore", {"memory_id": str(uuid.uuid4())})
     ).data
     assert res is None
+
+
+async def test_search_logging_feeds_stats(client, tag):
+    """Every search is logged; memory_stats turns the log into recall metrics.
+
+    The server is shared, so all assertions are deltas / containment, never
+    exact totals.
+    """
+    before = (await client.call_tool("memory_stats", {"days": 1})).data
+
+    saved = await _save(
+        client, tag,
+        "The deploy pipeline uses a blue-green cutover behind the load balancer.",
+        "blue-green deploy cutover",
+    )
+    miss_query = f"zzmiss{tag}"  # matches nothing lexically or semantically
+    try:
+        hit_search = (
+            await client.call_tool(
+                "memory_search",
+                {"query": "how do deploys cut over?", "scope": E2E_SCOPE,
+                 "tags": [tag], "min_similarity": 0.0},
+            )
+        ).data
+        assert hit_search  # this one must land so the stats see a non-empty search
+
+        empty_search = (
+            await client.call_tool(
+                "memory_search",
+                {"query": miss_query, "scope": E2E_SCOPE, "min_similarity": 0.99},
+            )
+        ).data
+        assert empty_search == []
+
+        after = (await client.call_tool("memory_stats", {"days": 1})).data
+        s = after["searches"]
+        assert s["total"] >= before["searches"]["total"] + 2
+        assert s["empty"] >= before["searches"]["empty"] + 1
+        assert 0.0 <= s["empty_rate"] <= 1.0
+        assert s["avg_hits"] is not None and s["avg_top_score"] is not None
+        assert s["p50_latency_ms"] > 0 and s["p95_latency_ms"] >= s["p50_latency_ms"]
+
+        # the miss shows up as an investigatable recall failure
+        assert miss_query in {q["query"] for q in after["recent_empty_queries"]}
+
+        # store-size side: our memory is counted in its scope
+        assert after["memories"]["active"] >= 1
+        assert any(r["scope"] == E2E_SCOPE for r in after["memories"]["by_scope"])
+    finally:
+        await client.call_tool("memory_delete", {"memory_id": saved["memory"]["id"]})
 
 
 async def test_save_dedupes_near_duplicate(client, tag):

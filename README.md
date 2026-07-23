@@ -22,8 +22,9 @@ relying on per-session context or hand-edited `CLAUDE.md` files.
 | `memory_get(memory_id)` | Fetch one by id |
 | `memory_list(scope?, tags?, limit, include_archived?)` | Browse recent memories (cheap index); `include_archived` to review forgotten ones |
 | `memory_delete(memory_id)` | Delete by id (hard) |
-| `memory_forget(scope?, tags?, older_than_days?, importance_floor?, apply?)` | Archive stale, low-importance memories; dry-run unless `apply: true` |
+| `memory_forget(scope?, tags?, older_than_days?, importance_floor?, apply?, limit?)` | Archive stale, low-importance memories; dry-run unless `apply: true` |
 | `memory_restore(memory_id)` | Un-archive a forgotten memory (inverse of `memory_forget`) |
+| `memory_stats(scope?, days?)` | Recall health: store size per scope + search volume, empty-rate, score/latency metrics |
 
 Search results carry both a raw `similarity` (0-1 cosine) and a blended `score` that
 adds recency decay (half-life `HM_RECENCY_HALF_LIFE_DAYS`) and normalised `importance`;
@@ -48,7 +49,17 @@ search/get/list but are kept, not destroyed — and a **dry run by default** (pa
 `apply: true` to act). `memory_delete` remains the hard, irreversible removal.
 Review what's been archived with `memory_list(include_archived=true)` and bring one
 back with `memory_restore(memory_id)` — restoring also refreshes its last-access time
-so the next sweep won't immediately re-forget it.
+so the next sweep won't immediately re-forget it. In both dry-run and apply results,
+`matched` is the true total the criteria hit (exactly what apply archives) while
+`memories` lists at most `limit` (default 100) of them, stalest first, with
+`truncated` set when the list was cut — a dry run can never under-report an apply.
+
+**Observability.** Every `memory_search` is logged (query, candidate/hit counts, top
+scores, latency) to a `search_log` table, and `memory_stats` aggregates it: search
+volume, empty-result rate, average hits and top score, latency percentiles, and the
+most recent queries that returned nothing — the recall misses worth investigating.
+Use it to tune `HM_SEARCH_MIN_SIMILARITY` and the score weights from evidence instead
+of feel. Logged queries land in the DB; disable with `HM_SEARCH_LOG_ENABLED=false`.
 
 `description` is a one-line summary used for ranking and de-duplication — treat it like
 the one-liners in Claude Code's `MEMORY.md` index.
@@ -105,8 +116,11 @@ to a `CLAUDE.md` (project-level, or `~/.claude/CLAUDE.md` for all projects):
   re-saving; only the fields you pass change.
 - Pass `scope: "shared"` only for things useful across every project.
 - Housekeeping: `memory_forget` archives stale, low-importance memories (dry-run unless
-  `apply: true`); `memory_list(include_archived=true)` reviews them and
+  `apply: true`; `matched` is the true total, `memories` a sample of at most `limit`);
+  `memory_list(include_archived=true)` reviews them and
   `memory_restore(memory_id)` brings one back. `memory_delete` is the hard removal.
+- `memory_stats(days?)` reports recall health: store size, search volume, empty-result
+  rate, and recent queries that found nothing — check it when recall feels off.
 - Search before saving; prefer updating a near-duplicate over creating a new memory.
 ```
 
