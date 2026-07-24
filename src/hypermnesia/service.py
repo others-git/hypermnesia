@@ -55,6 +55,23 @@ class MemoryService:
     async def _embed_query(self, query: str) -> Vector:
         return Vector(await asyncio.to_thread(self.embedder.embed_query, query))
 
+    async def _contents_match(self, old_content: str, new_content: str) -> bool:
+        """Second dedup gate: do the contents themselves agree?
+
+        Compares the two contents directly (not the stored combined vectors)
+        so a description-driven false positive from the first gate can't
+        survive here.
+        """
+        t = self.settings.dedupe_content_threshold
+        if t <= 0 or old_content == new_content:
+            return True
+        va, vb = await asyncio.to_thread(
+            self.embedder.embed_documents, [old_content, new_content]
+        )
+        dot = sum(a * b for a, b in zip(va, vb))
+        norm = (sum(a * a for a in va) ** 0.5) * (sum(b * b for b in vb) ** 0.5)
+        return norm > 0 and dot / norm >= t
+
     async def save(
         self,
         *,
@@ -93,7 +110,11 @@ class MemoryService:
                 )
             ).fetchone()
 
-            if dup and dup["similarity"] >= self.settings.dedupe_threshold:
+            if (
+                dup
+                and dup["similarity"] >= self.settings.dedupe_threshold
+                and await self._contents_match(dup["content"], content)
+            ):
                 replaced = Memory(**{k: v for k, v in dup.items() if k != "similarity"})
                 row = await (
                     await conn.execute(
@@ -507,6 +528,17 @@ class MemoryService:
                 {"query": m["query"], "at": m["created_at"].isoformat()} for m in misses
             ],
         }
+
+    async def distinct_scopes(self) -> list[str]:
+        """Every scope with at least one active memory (for the sweep, which
+        runs server-side and isn't bound to a caller's grants)."""
+        async with self.pool.connection() as conn:
+            rows = await (
+                await conn.execute(
+                    "SELECT DISTINCT scope FROM memories WHERE archived_at IS NULL"
+                )
+            ).fetchall()
+        return sorted(r[0] for r in rows)
 
     async def forget(
         self,

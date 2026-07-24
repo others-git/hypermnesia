@@ -162,6 +162,22 @@ async def test_reindex_swaps_model_and_back(client, tag):
         await client.call_tool("memory_delete", {"memory_id": mid})
 
 
+async def test_distinct_scopes_covers_the_store(client, tag):
+    """The sweep's scope inventory (direct SQL) sees scopes written via MCP."""
+    from hypermnesia.config import Settings
+    from hypermnesia.db import make_pool
+    from hypermnesia.service import MemoryService
+
+    saved = await _save(client, tag, "scope inventory marker", "scope marker")
+    pool = await make_pool(DB_URL)
+    try:
+        svc = MemoryService(pool=pool, embedder=None, settings=Settings())
+        assert E2E_SCOPE in await svc.distinct_scopes()
+    finally:
+        await pool.close()
+        await client.call_tool("memory_delete", {"memory_id": saved["memory"]["id"]})
+
+
 async def test_reindex_refuses_missing_store(tmp_path):
     # Point at a real Postgres but a database that has no memories table.
     import psycopg

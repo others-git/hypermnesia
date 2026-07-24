@@ -513,6 +513,32 @@ async def test_save_dedupes_near_duplicate(client, tag):
         await client.call_tool("memory_delete", {"memory_id": a["memory"]["id"]})
 
 
+async def test_same_description_different_fact_is_not_clobbered(client, tag):
+    """Two different facts under the same description must coexist — the
+    content dedup gate keeps the first from being silently overwritten."""
+    a = await _save(
+        client, tag,
+        "Production deploys go to the Frankfurt region on Fridays.",
+        "deploy target",
+    )
+    b = await _save(
+        client, tag,
+        "The staging cluster is a minikube VM on the office NAS.",
+        "deploy target",
+    )
+    ids = {a["memory"]["id"], b["memory"]["id"]}
+    try:
+        assert b["created"] is True
+        assert len(ids) == 2
+        listed = (
+            await client.call_tool("memory_list", {"scope": E2E_SCOPE, "tags": [tag]})
+        ).data
+        assert ids <= {m["id"] for m in listed}
+    finally:
+        for mid in ids:
+            await client.call_tool("memory_delete", {"memory_id": mid})
+
+
 async def test_write_to_unauthorized_scope_is_rejected(client):
     with pytest.raises(Exception) as exc:
         await client.call_tool(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from fastmcp import Context, FastMCP
@@ -19,16 +20,52 @@ from .service import MemoryService
 
 mcp = FastMCP("hypermnesia")
 
+logger = logging.getLogger("hypermnesia")
+
 _service: MemoryService | None = None
+_sweep_task: asyncio.Task | None = None
 _lock = asyncio.Lock()
 
 
+async def run_forget_sweep_once(svc: MemoryService, settings) -> dict[str, Any]:
+    """One pass of the periodic forget sweep, over every scope in the store."""
+    result = await svc.forget(
+        await svc.distinct_scopes(),
+        older_than_days=settings.forget_after_days,
+        importance_floor=settings.forget_importance_floor,
+        apply=True,
+    )
+    if result["matched"]:
+        logger.info(
+            "forget sweep archived %d stale memories: %s",
+            result["matched"],
+            [m["description"] for m in result["memories"]],
+        )
+    return result
+
+
+async def forget_sweep_loop(svc: MemoryService, settings) -> None:
+    """Sleep-first loop (no surprise archiving at boot); one failed pass is
+    logged and the loop keeps going."""
+    while True:
+        await asyncio.sleep(settings.forget_sweep_hours * 3600)
+        try:
+            await run_forget_sweep_once(svc, settings)
+        except Exception:  # noqa: BLE001 - the sweep must outlive one bad pass
+            logger.exception("forget sweep failed")
+
+
 async def _get_service() -> MemoryService:
-    global _service
+    global _service, _sweep_task
     if _service is None:
         async with _lock:
             if _service is None:
-                _service = await MemoryService.create(get_settings())
+                settings = get_settings()
+                _service = await MemoryService.create(settings)
+                if settings.forget_sweep_hours > 0:
+                    _sweep_task = asyncio.create_task(
+                        forget_sweep_loop(_service, settings)
+                    )
     return _service
 
 

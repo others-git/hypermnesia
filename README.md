@@ -53,6 +53,9 @@ so the next sweep won't immediately re-forget it. In both dry-run and apply resu
 `matched` is the true total the criteria hit (exactly what apply archives) while
 `memories` lists at most `limit` (default 100) of them, stalest first, with
 `truncated` set when the list was cut — a dry run can never under-report an apply.
+Set `HM_FORGET_SWEEP_HOURS` (default 0 = off) to have the server run the sweep itself
+periodically over every scope, using the two thresholds above; archived descriptions
+are logged each pass.
 
 **Observability.** Every `memory_search` is logged (query, candidate/hit counts, top
 scores, latency) to a `search_log` table, and `memory_stats` aggregates it: search
@@ -62,7 +65,11 @@ Use it to tune `HM_SEARCH_MIN_SIMILARITY` and the score weights from evidence in
 of feel. Logged queries land in the DB; disable with `HM_SEARCH_LOG_ENABLED=false`.
 
 `description` is a one-line summary used for ranking and de-duplication — treat it like
-the one-liners in Claude Code's `MEMORY.md` index.
+the one-liners in Claude Code's `MEMORY.md` index. De-duplication is two-gated: the
+combined embedding must clear `HM_DEDUPE_THRESHOLD` **and** the contents themselves must
+agree (`HM_DEDUPE_CONTENT_THRESHOLD`, default 0.9) — so two different facts that merely
+share a description shape insert side by side instead of one silently clobbering the
+other. Failing the gate errs toward a duplicate (recoverable) over a lost fact (not).
 
 ## Quick start (Docker)
 

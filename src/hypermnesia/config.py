@@ -32,6 +32,13 @@ class Settings(BaseSettings):
 
     # --- recall / write behaviour ---
     dedupe_threshold: float = 0.92  # cosine sim above which save() updates the near-duplicate
+    # Second dedup gate: a merge additionally requires the CONTENTS to be this
+    # similar. The combined description+content embedding can clear
+    # dedupe_threshold on the description alone, and merging two different
+    # facts that merely share a description shape silently destroys one of
+    # them. Failing the gate inserts instead (duplicates are recoverable;
+    # clobbered facts are not). 0 disables.
+    dedupe_content_threshold: float = 0.9
     default_top_k: int = 8
 
     # Drop hits below this cosine similarity so weak matches don't pollute recall.
@@ -73,6 +80,11 @@ class Settings(BaseSettings):
     # below the floor. Recall and a higher importance both keep a memory alive.
     forget_after_days: float = 180.0
     forget_importance_floor: float = 1.0
+    # Opt-in periodic sweep: every this many hours the server archives what
+    # memory_forget(apply=true) would, over every scope, using the two
+    # thresholds above. 0 (the default) disables it — forgetting then only
+    # happens when a client calls memory_forget explicitly.
+    forget_sweep_hours: float = 0.0
 
     # --- server ---
     host: str = "127.0.0.1"
