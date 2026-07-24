@@ -20,6 +20,16 @@ class Embedder(Protocol):
     def embed_query(self, text: str) -> list[float]: ...
 
 
+def record_text(description: str, content: str) -> str:
+    """The canonical text a memory is embedded from.
+
+    Save, update, import, and reindex must all embed the exact same text or
+    stored vectors drift from what search expects — change it only alongside a
+    full reindex.
+    """
+    return f"{description}\n\n{content}"
+
+
 _REGISTRY: dict[str, type] = {}
 
 

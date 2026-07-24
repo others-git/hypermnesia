@@ -54,9 +54,14 @@ services:
       HM_TEST_URL: http://server:8765/mcp
       HM_TEST_TOKEN: dev-token
       HM_TEST_SCOPE: user:dev-test
+      # Direct DB access enables the admin-CLI e2e tests (export/import/reindex);
+      # the alt model exercises a real dimension change (384 -> 512) in reindex.
+      HM_TEST_DATABASE_URL: postgresql://hypermnesia:hypermnesia@db:5432/hypermnesia
+      HM_TEST_ALT_MODEL: jinaai/jina-embeddings-v2-small-en
     volumes:
       - ./tests:/app/tests
       - ./pyproject.toml:/app/pyproject.toml
+      - hm_models:/root/.cache/fastembed
     command:
       - sh
       - -c

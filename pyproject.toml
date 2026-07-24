@@ -29,7 +29,7 @@ dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
 Repository = "https://github.com/others-git/hypermnesia"
 
 [project.scripts]
-hypermnesia = "hypermnesia.server:main"
+hypermnesia = "hypermnesia.cli:main"
 
 [build-system]
 requires = ["hatchling"]

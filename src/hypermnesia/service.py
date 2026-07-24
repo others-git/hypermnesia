@@ -12,7 +12,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from .config import Settings
 from .db import init_schema, make_pool
-from .embeddings import Embedder, create_embedder
+from .embeddings import Embedder, create_embedder, record_text
 from .models import Memory, SearchHit
 
 _SELECT_COLS = (
@@ -48,7 +48,7 @@ class MemoryService:
 
     async def _embed_record(self, description: str, content: str) -> Vector:
         vecs = await asyncio.to_thread(
-            self.embedder.embed_documents, [f"{description}\n\n{content}"]
+            self.embedder.embed_documents, [record_text(description, content)]
         )
         return Vector(vecs[0])
 

@@ -188,6 +188,10 @@ pytest -m "not e2e"           # unit tests only (no DB/network needed)
 - **End-to-end** (`tests/test_e2e.py`): black-box CRUD + semantic recall + auth/scope
   isolation, driven through the MCP tools against a running server. They auto-skip if no
   server is reachable.
+- **Admin CLI e2e** (`tests/test_cli_e2e.py`): export/import restore + reindex model
+  swap. Need direct DB access, so they only run where `HM_TEST_DATABASE_URL` is set
+  (the compose test container sets it); `HM_TEST_ALT_MODEL` gates the
+  dimension-change reindex test.
 
 Run the whole suite against the Docker stack (dev overlay builds from source):
 
@@ -211,12 +215,42 @@ All settings are env vars with the `HM_` prefix (see `.env.example`). Key ones:
 | `HM_AUTH_TOKENS` | `{}` | `{"token":{"principal":"id","scopes":["..."]}}` |
 | `HM_REQUIRE_AUTH` | `true` | when false, all callers are `anonymous`/`default` |
 
+## Admin CLI (backup & model migration)
+
+The `hypermnesia` binary doubles as an admin CLI. These subcommands run on the server
+host with **direct DB access** (they read `HM_DATABASE_URL` etc.) and bypass MCP
+auth/scopes on purpose — they are the backup and migration story, not agent tools:
+
+```bash
+hypermnesia export --out dump.jsonl        # all memories (archived too), as JSONL
+hypermnesia export --scope shared          # limit to scopes; repeatable; - = stdout
+hypermnesia import dump.jsonl              # restore a dump; existing ids are skipped
+hypermnesia reindex                        # re-embed everything with HM_EMBEDDING_*
+```
+
+Dumps exclude embeddings, so they survive an embedding-model change — `import`
+re-embeds with the configured model, preserving ids and timestamps and never
+overwriting an existing row (re-running a restore is idempotent). In a Docker setup:
+`docker compose exec server hypermnesia export --out - > dump.jsonl`. **Take dumps
+periodically** — the Postgres volume is otherwise the only copy of every memory.
+
 ### Swapping the embedding model
 
 Set `HM_EMBEDDING_PROVIDER` / `HM_EMBEDDING_MODEL`. The vector dimension is auto-detected
-and **pinned** in the store on first run. Switching to a model with a different dimension
-(or a different model entirely) is refused with a clear error, because existing vectors
-would no longer be comparable — re-index (dump, drop, reload) when changing models.
+and **pinned** in the store on first run. Starting the server with a different model
+(or dimension) is refused with a clear error, because existing vectors would no longer
+be comparable. The migration path is `reindex`:
+
+```bash
+HM_EMBEDDING_MODEL=new-model hypermnesia reindex   # re-embeds all rows, swaps the
+                                                   # vector column + HNSW index, and
+                                                   # updates the pin — one transaction
+# then restart the server with the new HM_EMBEDDING_* settings
+```
+
+Until the restart, the running server still embeds with the old model and will error —
+run reindex during a quiet moment. Also re-tune `HM_SEARCH_MIN_SIMILARITY` after a
+model swap (cosine ranges differ per model).
 
 To add a new provider, implement the `Embedder` protocol and `@register("name")` it in
 `src/hypermnesia/embeddings/providers.py`.
