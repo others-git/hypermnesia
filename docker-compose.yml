@@ -61,6 +61,11 @@ services:
       HM_TEST_ALT_MODEL: jinaai/jina-embeddings-v2-small-en
     volumes:
       - ./tests:/app/tests
+      # The ranking eval's corpus is not runtime code so it is not in the image,
+      # but tests/test_eval_corpus.py guards its labels and imports it. WORKDIR
+      # is /app and `python -m pytest` puts the cwd on sys.path, so mounting it
+      # here is what makes `import evals` resolve.
+      - ./evals:/app/evals
       - ./pyproject.toml:/app/pyproject.toml
       - hm_models:/root/.cache/fastembed
     command:
