@@ -29,6 +29,7 @@ services:
       HM_DATABASE_URL: postgresql://hypermnesia:hypermnesia@db:5432/hypermnesia
       HM_HOST: 0.0.0.0
       HM_PORT: "8765"
+      HM_LOG_LEVEL: INFO
       HM_EMBEDDING_PROVIDER: fastembed
       HM_EMBEDDING_MODEL: BAAI/bge-small-en-v1.5
       # Replace with your own tokens before exposing this anywhere:

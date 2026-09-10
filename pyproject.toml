@@ -12,7 +12,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "fastmcp>=2.3",
+    # <5 is a real guard, not caution: FastMCP 4 removed Context.list_roots
+    # and silently collapsed every project into one scope until we handled it.
+    "fastmcp>=2.3,<5",
     "psycopg[binary]>=3.2",
     "psycopg-pool>=3.2",
     "pgvector>=0.3",

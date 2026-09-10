@@ -142,7 +142,9 @@ async def test_semantic_recall_ranks_relevant_first(client, tag):
                     "scope": E2E_SCOPE,
                     "tags": [tag],
                     "k": 2,
-                    "min_similarity": 0.0,  # independent of the configured floor
+                    # Both gates off: this asserts ranking order, not filtering.
+                    "min_similarity": 0.0,
+                    "relative_cutoff": 0.0,
                 },
             )
         ).data
@@ -232,6 +234,70 @@ async def test_min_similarity_filters_weak_matches(client, tag):
         assert hits == []
     finally:
         await client.call_tool("memory_delete", {"memory_id": saved["memory"]["id"]})
+
+
+async def test_relative_cutoff_trims_the_near_misses(client, tag):
+    """A clear winner should not arrive buried in loosely-related memories.
+
+    The absolute floor cannot do this: unrelated memories score well inside
+    bge-small's cosine range, so a floor loose enough to keep the answer keeps
+    them too. Distance to the best hit separates them.
+    """
+    winner = await _save(
+        client,
+        tag,
+        "The deploy pipeline pushes to GHCR only on tags matching v*, never on "
+        "branch pushes; a branch push builds the image but skips the registry.",
+        "deploy pushes to GHCR on version tags only",
+    )
+    others = []
+    for content, desc in [
+        ("Postgres connection pooling uses psycopg_pool with max_size 10.",
+         "pg connection pooling settings"),
+        ("Run the unit suite with pytest -m 'not e2e'; it needs no infrastructure.",
+         "running the unit test suite"),
+        ("The embedding model is pinned in hm_meta on first run and cannot change.",
+         "embedding model is pinned in the store"),
+    ]:
+        others.append(await _save(client, tag, content, desc))
+    ids = [winner["memory"]["id"]] + [o["memory"]["id"] for o in others]
+    try:
+        args = {"query": "when does CI publish the image to the registry",
+                "scope": E2E_SCOPE, "tags": [tag], "min_similarity": 0.0}
+        wide = (await client.call_tool(
+            "memory_search", {**args, "relative_cutoff": 0.0})).data
+        tight = (await client.call_tool("memory_search", args)).data  # configured default
+
+        assert len(wide) == 4, "floor alone keeps every near-miss"
+        assert tight[0]["id"] == winner["memory"]["id"]
+        assert len(tight) < len(wide), "the relative gate trims the near-misses"
+    finally:
+        for mid in ids:
+            await client.call_tool("memory_delete", {"memory_id": mid})
+
+
+async def test_relative_cutoff_of_zero_is_an_escape_hatch(client, tag):
+    # An agent wanting a broad survey rather than the best answer can turn the
+    # gate off per search, and then sees everything the floor admits.
+    saved = [
+        await _save(client, tag, "Rate limiting is enforced per principal.",
+                    "per-principal rate limits"),
+        await _save(client, tag, "Bread dough proofs for 12 hours at 4 degrees.",
+                    "sourdough cold proofing schedule"),
+    ]
+    ids = [x["memory"]["id"] for x in saved]
+    try:
+        hits = (
+            await client.call_tool(
+                "memory_search",
+                {"query": "rate limits", "scope": E2E_SCOPE, "tags": [tag],
+                 "min_similarity": 0.0, "relative_cutoff": 0.0},
+            )
+        ).data
+        assert {h["id"] for h in hits} == set(ids)
+    finally:
+        for mid in ids:
+            await client.call_tool("memory_delete", {"memory_id": mid})
 
 
 async def test_update_changes_only_given_fields(client, tag):
@@ -429,6 +495,49 @@ async def test_restore_unarchives_memory(client, tag):
         await client.call_tool("memory_delete", {"memory_id": mid})
 
 
+async def test_list_is_an_index_and_omits_content(client, tag):
+    """`memory_list` is for orientation, so it must not carry every body.
+
+    Content runs ~11x longer than the description; including it made the default
+    limit=50 call cost roughly four times what the index itself costs.
+    """
+    saved = await _save(
+        client,
+        tag,
+        "A deliberately long body that a caller scanning an index has no use for. " * 6,
+        "short one-line description",
+    )
+    mid = saved["memory"]["id"]
+    try:
+        (row,) = (
+            await client.call_tool("memory_list", {"scope": E2E_SCOPE, "tags": [tag]})
+        ).data
+        assert "content" not in row
+        assert row["description"] == "short one-line description"
+        # the index still carries everything needed to pick and then fetch
+        assert row["id"] == mid and "importance" in row and "tags" in row
+        # ...and memory_get is the way to get the body
+        assert "deliberately long body" in (
+            await client.call_tool("memory_get", {"memory_id": mid})
+        ).data["content"]
+    finally:
+        await client.call_tool("memory_delete", {"memory_id": mid})
+
+
+async def test_list_full_true_restores_content(client, tag):
+    saved = await _save(client, tag, "the whole body", "desc for full listing")
+    mid = saved["memory"]["id"]
+    try:
+        (row,) = (
+            await client.call_tool(
+                "memory_list", {"scope": E2E_SCOPE, "tags": [tag], "full": True}
+            )
+        ).data
+        assert row["content"] == "the whole body"
+    finally:
+        await client.call_tool("memory_delete", {"memory_id": mid})
+
+
 async def test_restore_unknown_id_returns_null(client):
     res = (
         await client.call_tool("memory_restore", {"memory_id": str(uuid.uuid4())})
@@ -539,6 +648,49 @@ async def test_same_description_different_fact_is_not_clobbered(client, tag):
             await client.call_tool("memory_delete", {"memory_id": mid})
 
 
+async def test_usage_guide_is_generated_from_the_live_server(client):
+    """The guide must describe *this* server, not a copy of a README."""
+    g = (await client.call_tool("memory_usage_guide", {})).data
+    assert set(g) == {"claude_md", "setup", "session", "warnings"}
+
+    # Generated from the live tool registry: every registered tool is named.
+    names = {t.name for t in await client.list_tools()}
+    for name in names:
+        assert name in g["claude_md"], f"{name} missing from generated guidance"
+
+    # ...and from live settings, not a hardcoded string.
+    assert "hypermnesia" in g["claude_md"]
+    assert "/mcp" in g["setup"]
+    assert g["session"]["principal"]
+    assert g["session"]["scopes_you_can_read"]
+
+
+async def test_usage_guide_sections_and_bad_input(client):
+    only = (await client.call_tool("memory_usage_guide", {"section": "setup"})).data
+    assert set(only) == {"setup", "warnings"}
+    with pytest.raises(Exception) as exc:
+        await client.call_tool("memory_usage_guide", {"section": "nope"})
+    assert "unknown section" in str(exc.value)
+
+
+async def test_usage_guide_reports_the_sessions_own_project_scope(tag):
+    key = f"guide-{tag}"
+    async with make_client(project_header=key) as c:
+        g = (await c.call_tool("memory_usage_guide", {"section": "session"})).data
+        assert g["session"]["project_scope"] == f"project:{key}"
+        assert g["session"]["project_isolation"] == "active"
+        assert f"project:{key}" not in str(g["warnings"])
+
+
+async def test_usage_guide_warns_when_project_isolation_is_off(client):
+    """The default-scope fallback is the silent failure worth shouting about."""
+    g = (await client.call_tool("memory_usage_guide", {"section": "session"})).data
+    if g["session"]["project_scope"] != "default":
+        pytest.skip("this session resolved a real project scope")
+    assert g["session"]["project_isolation"].startswith("NOT ACTIVE")
+    assert any("NOT isolated" in w for w in g["warnings"])
+
+
 async def test_write_to_unauthorized_scope_is_rejected(client):
     with pytest.raises(Exception) as exc:
         await client.call_tool(
@@ -556,9 +708,48 @@ async def test_unauthenticated_call_is_rejected():
     assert "authorization" in msg or "bearer" in msg
 
 
+async def test_projects_do_not_trample_via_header(tag):
+    """Two sessions keyed by different X-Hypermnesia-Project headers are isolated
+    with no explicit scope passed — the trampling scenario for a global config.
+
+    The header is the mechanism that works on every transport, so this is the
+    guaranteed-coverage twin of the roots test below.
+    """
+    alpha, beta = f"alpha-{tag}", f"beta-{tag}"
+
+    async with make_client(project_header=alpha) as a:
+        saved = await a.call_tool(
+            "memory_save",
+            {"content": "alpha-only secret value", "description": f"alpha {tag}",
+             "tags": [tag]},
+        )
+        aid = saved.data["memory"]["id"]
+        assert saved.data["memory"]["scope"] == f"project:{alpha}"
+        hits = (
+            await a.call_tool("memory_search", {"query": "secret value", "tags": [tag]})
+        ).data
+        assert any(h["id"] == aid for h in hits)
+
+    try:
+        async with make_client(project_header=beta) as b:
+            hits = (
+                await b.call_tool("memory_search", {"query": "secret value", "tags": [tag]})
+            ).data
+            assert all(h["id"] != aid for h in hits)
+            assert (await b.call_tool("memory_get", {"memory_id": aid})).data is None
+    finally:
+        async with make_client(project_header=alpha) as a:
+            await a.call_tool("memory_delete", {"memory_id": aid})
+
+
 async def test_projects_do_not_trample_via_roots(tag):
-    """Two sessions with different workspace roots are isolated automatically,
-    with no explicit scope passed — the trampling scenario for a global config."""
+    """Same isolation, derived automatically from MCP workspace roots.
+
+    Roots are best-effort: the capability is deprecated (SEP-2577) and the
+    server cannot request them on a transport with no back-channel for
+    server-initiated requests. Where they don't resolve this skips rather than
+    fails — the isolation property itself is covered by the header test above.
+    """
     alpha = [f"file:///workspace/alpha-{tag}"]
     beta = [f"file:///workspace/beta-{tag}"]
 
@@ -570,6 +761,12 @@ async def test_projects_do_not_trample_via_roots(tag):
              "tags": [tag]},
         )
         aid = saved.data["memory"]["id"]
+        if saved.data["memory"]["scope"] == "default":
+            await a.call_tool("memory_delete", {"memory_id": aid})
+            pytest.skip(
+                "client/transport did not deliver workspace roots (deprecated "
+                "capability, needs a back-channel); header test covers isolation"
+            )
         assert saved.data["memory"]["scope"].startswith("project:alpha-")
         # alpha recalls its own memory (no scope passed)
         hits = (

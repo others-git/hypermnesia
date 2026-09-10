@@ -15,6 +15,8 @@ from .auth import (
     resolve_principal,
 )
 from .config import Principal, get_settings
+from .guide import build as build_guide
+from .guide import tool_summaries
 from .scoping import derive_project_scope
 from .service import MemoryService
 
@@ -23,6 +25,7 @@ mcp = FastMCP("hypermnesia")
 logger = logging.getLogger("hypermnesia")
 
 _service: MemoryService | None = None
+_warned_no_project = False
 _sweep_task: asyncio.Task | None = None
 _lock = asyncio.Lock()
 
@@ -78,22 +81,71 @@ def _principal() -> Principal:
         raise ToolError(str(e)) from e
 
 
+async def _list_roots(ctx: Context) -> list[str]:
+    """Ask the client for its workspace roots, across FastMCP versions.
+
+    FastMCP 4 dropped ``Context.list_roots``; the MCP session method underneath
+    it stayed. Trying both keeps project scoping working on 2.x through 4.x --
+    when it broke, every project silently shared the ``default`` scope, which is
+    exactly the trampling this scoping is here to prevent.
+    """
+    candidates = (
+        getattr(ctx, "list_roots", None),
+        getattr(getattr(ctx, "session", None), "list_roots", None),
+    )
+    for call in candidates:
+        if call is None:
+            continue
+        try:
+            result = await call()
+        except Exception as e:  # noqa: BLE001 - a client may not support roots
+            # Debug, not warning: a client that genuinely advertises no roots
+            # takes this path on every call and is a supported configuration.
+            logger.debug("roots request failed (%s: %s)", type(e).__name__, e)
+            continue
+        raw = getattr(result, "roots", result)
+        return [str(getattr(r, "uri", r)) for r in raw]
+    logger.debug("no usable roots API on this FastMCP version; falling back")
+    return []
+
+
 async def _project_scope(ctx: Context) -> str:
     """Derive the calling session's project scope from its workspace root.
 
     Clients (e.g. Claude Code) advertise the project directory as an MCP root;
     a ``X-Hypermnesia-Project`` header overrides it for stable/shared keys.
+
+    Roots are best-effort: the capability is deprecated (SEP-2577) and a server
+    cannot request them at all on a transport with no back-channel. The header
+    is the mechanism that always works.
     """
+    scope, _ = await _project_scope_with_roots(ctx)
+    return scope
+
+
+async def _project_scope_with_roots(ctx: Context) -> tuple[str, bool]:
+    """As ``_project_scope``, also reporting whether roots actually resolved.
+
+    The guide reports on the session's real configuration, and "roots worked"
+    is exactly the fact that was silently wrong before.
+    """
+    global _warned_no_project
     headers = get_http_headers(include_all=True)
     override = headers.get("x-hypermnesia-project")
-    roots: list[str] = []
-    try:
-        result = await ctx.list_roots()
-        raw = getattr(result, "roots", result)
-        roots = [str(getattr(r, "uri", r)) for r in raw]
-    except Exception:  # noqa: BLE001 - clients without roots support fall back
-        roots = []
-    return derive_project_scope(roots, override)
+    roots = await _list_roots(ctx)
+    scope = derive_project_scope(roots, override)
+    if scope == "default" and not _warned_no_project:
+        # Once per process, at warning level: this is the state where every
+        # project shares one pool of memories, and it is indistinguishable from
+        # working until two projects have already contaminated each other.
+        _warned_no_project = True
+        logger.warning(
+            "no workspace roots and no X-Hypermnesia-Project header: memories "
+            "fall back to the 'default' scope, shared by every project using "
+            "this server. Set the X-Hypermnesia-Project header per project to "
+            "keep them apart."
+        )
+    return scope, bool(roots)
 
 
 def _read_scopes(p: Principal, project_scope: str, requested: str | None) -> list[str]:
@@ -111,20 +163,28 @@ async def memory_search(
     tags: list[str] | None = None,
     k: int = 8,
     min_similarity: float | None = None,
+    relative_cutoff: float | None = None,
 ) -> list[dict[str, Any]]:
     """Semantically recall memories relevant to `query`.
 
     Search this before starting a task. By default searches the current project's
     memories plus any shared scopes — never another project's. Results are ranked
     by a blend of semantic `similarity` (0-1), recency, and importance, exposed as
-    `score`. Pass `min_similarity` (e.g. 0.3) to drop weak matches.
+    `score`.
+
+    Two knobs trade recall for precision. `min_similarity` (e.g. 0.3) is an
+    absolute floor on `similarity`. `relative_cutoff` (default 0.15) drops hits
+    that fall more than that far below the best hit of this search — it is what
+    keeps a good answer from arriving buried in near-miss memories. Raise it (or
+    pass 0.0 to disable) when you want a broad survey of everything related
+    rather than the best answer.
     """
     p = _principal()
     scopes = _read_scopes(p, await _project_scope(ctx), scope)
     svc = await _get_service()
     hits = await svc.search(
         query=query, scopes=scopes, tags=tags, k=k, min_similarity=min_similarity,
-        owner_id=p.id,
+        relative_cutoff=relative_cutoff, owner_id=p.id,
     )
     return [h.model_dump(mode="json") for h in hits]
 
@@ -220,8 +280,16 @@ async def memory_list(
     tags: list[str] | None = None,
     limit: int = 50,
     include_archived: bool = False,
+    full: bool = False,
 ) -> list[dict[str, Any]]:
-    """Browse recent memories (newest first). Use as a cheap index of what's stored.
+    """Browse recent memories (newest first). A cheap index of what's stored.
+
+    Returns each memory's `description` (the one-line summary) and metadata but
+    **not** its `content` — that is what makes this cheap enough to call for
+    orientation: content runs ~11x longer than the description and would be ~74%
+    of the payload. Scan the descriptions, then `memory_get(memory_id)` the one
+    you actually need. Pass `full: true` only when you genuinely need every
+    body at once (e.g. an audit), and prefer a smaller `limit` with it.
 
     Defaults to the current project plus shared scopes, and hides archived
     (forgotten) memories. Pass `include_archived: true` to review what was archived
@@ -231,7 +299,8 @@ async def memory_list(
     scopes = _read_scopes(p, await _project_scope(ctx), scope)
     svc = await _get_service()
     items = await svc.list(scopes, tags=tags, limit=limit, include_archived=include_archived)
-    return [m.model_dump(mode="json") for m in items]
+    exclude = set() if full else {"content"}
+    return [m.model_dump(mode="json", exclude=exclude) for m in items]
 
 
 @mcp.tool
@@ -322,8 +391,50 @@ async def memory_forget(
     )
 
 
+@mcp.tool
+async def memory_usage_guide(ctx: Context, section: str = "all") -> dict[str, Any]:
+    """Generate up-to-date instructions for using this memory server.
+
+    Returns guidance built from *this* server's live settings, registered tools,
+    and your session — so it states how the server actually behaves rather than
+    how some copy of a README once described it. Call it when setting the server
+    up, after upgrading it, or when asked to add/refresh memory guidelines.
+
+    Sections (`section`, default "all"):
+      - `claude_md` — a ready-to-write CLAUDE.md section telling an agent when to
+        call each tool, with this server's real defaults filled in. Write it into
+        the project's `CLAUDE.md` (or `~/.claude/CLAUDE.md` for every project),
+        replacing any previous hypermnesia section rather than appending a second.
+      - `setup` — client registration snippets for this server's address.
+      - `session` — what your connection resolved to: principal, project scope,
+        readable scopes, whether workspace roots were detected.
+
+    Always check the returned `warnings`: that is where a silently degraded
+    setup — most importantly, project isolation not being active — shows up.
+    """
+    p = _principal()
+    project_scope, roots_ok = await _project_scope_with_roots(ctx)
+    try:
+        return build_guide(
+            settings=get_settings(),
+            tools=tool_summaries(globals().values()),
+            principal_id=p.id,
+            project_scope=project_scope,
+            read_scopes=_read_scopes(p, project_scope, None),
+            roots_resolved=roots_ok,
+            section=section,
+        )
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+
+
 def main() -> None:
     settings = get_settings()
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logger.setLevel(settings.log_level.upper())
     mcp.run(transport="http", host=settings.host, port=settings.port)
 
 
