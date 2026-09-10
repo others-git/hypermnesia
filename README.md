@@ -53,11 +53,21 @@ deliberately does nothing when results are flat (an off-topic query with no stan
 so it narrows a good answer's neighbourhood rather than inventing one, and lexical
 hits bypass it exactly as they bypass the floor.
 
-Search is **hybrid**: a vector (semantic) query and a Postgres full-text (keyword)
-query are fused with reciprocal-rank fusion, so exact tokens the embedding can't
-capture — error codes, flag names, file paths, names — still surface. A pure keyword
-hit bypasses the similarity floor on purpose. Toggle with `HM_HYBRID_SEARCH`; tune the
-fusion via `HM_RRF_K`, `HM_HYBRID_VECTOR_WEIGHT`, `HM_HYBRID_LEXICAL_WEIGHT`.
+Search is **hybrid**: a vector (semantic) query runs alongside a Postgres full-text
+(keyword) query, so exact tokens the embedding can't capture — error codes, flag
+names, file paths, names — still surface. A pure keyword hit bypasses the similarity
+floor on purpose. Toggle with `HM_HYBRID_SEARCH`.
+
+The two signals are combined by **keeping cosine similarity as the relevance and
+adding a bounded bonus for a keyword match** (`HM_HYBRID_LEXICAL_BOOST`, default
+`0.10`, decaying with lexical rank via `HM_HYBRID_RANK_DECAY_K`). It is deliberately
+not reciprocal-rank fusion: RRF keeps only ranks, which handed every keyword match a
+flat relevance jump larger than the entire spread of similarity scores. Because
+Postgres' `websearch_to_tsquery` requires *all* query terms to match, which memories
+match a conversational question is close to arbitrary — so that jump promoted
+memories that merely shared the question's function words over the one that answered
+it. Capping the bonus keeps exact-token recall without letting wording overrule
+meaning.
 
 **Forgetting.** Stores grow forever and old clutter dilutes recall, so `memory_forget`
 archives memories that are both stale (not recalled in `HM_FORGET_AFTER_DAYS`, default
@@ -254,8 +264,9 @@ All settings are env vars with the `HM_` prefix (see `.env.example`). Key ones:
 | `HM_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | any model the provider supports |
 | `HM_SEARCH_MIN_SIMILARITY` | `0.4` | absolute cosine floor; model-specific, re-tune on a model swap |
 | `HM_SEARCH_RELATIVE_CUTOFF` | `0.15` | drop hits this far below the best hit; `0` disables |
-| `HM_HYBRID_SEARCH` | `true` | fuse vector + Postgres full-text recall (`HM_RRF_K`, `HM_HYBRID_*_WEIGHT`) |
-| `HM_SCORE_WEIGHT_*` | `1.0`/`0.25`/`0.15` | similarity / recency / importance blend |
+| `HM_HYBRID_SEARCH` | `true` | also run a Postgres full-text query alongside the vector one |
+| `HM_HYBRID_LEXICAL_BOOST` | `0.10` | most a keyword match adds to relevance; decays with lexical rank |
+| `HM_SCORE_WEIGHT_*` | `1.0`/`0.10`/`0.06` | similarity / recency / importance blend; recency and importance are tie-breakers, so keep them small next to how much similarity actually varies (~0.18 for bge-small) |
 | `HM_DEDUPE_THRESHOLD` | `0.92` | cosine sim above which `save` updates vs. inserts |
 | `HM_DEDUPE_CONTENT_THRESHOLD` | `0.9` | second gate: contents must agree too, or it inserts |
 | `HM_FORGET_AFTER_DAYS` | `180` | staleness threshold for `memory_forget` |

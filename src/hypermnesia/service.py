@@ -181,7 +181,7 @@ class MemoryService:
         k: int,
         relative_cutoff: float = 0.0,
     ) -> list[SearchHit]:
-        """Reciprocal-rank-fuse vector + lexical candidates, then blend and rank.
+        """Combine vector + lexical candidates into a relevance, then blend and rank.
 
         ``vrows`` are ordered by vector distance, ``lrows`` by lexical rank; each
         row carries cosine ``similarity``. Two gates drop purely semantic
@@ -189,19 +189,21 @@ class MemoryService:
         below the best hit of this search a candidate may fall before it counts
         as noise beside it. A lexical match bypasses both (an exact-token hit is
         intentional relevance, not noise). Returns the top ``k`` SearchHits.
+
+        Relevance is the candidate's own cosine similarity plus a bounded,
+        rank-decayed bonus for appearing in the lexical list. Similarity is
+        already calibrated in [0,1], so using it directly keeps the *magnitude*
+        of a semantic match — which reciprocal-rank fusion discards, and which is
+        the only thing that can tell a memory that answers the query from one
+        that merely shares its wording. See the hybrid block in config.py.
         """
         s = self.settings
-        kk = s.rrf_k
-        wv, wl = s.hybrid_vector_weight, s.hybrid_lexical_weight
-        vrank = {r["id"]: i for i, r in enumerate(vrows, 1)}
+        kk = s.hybrid_rank_decay_k
         lrank = {r["id"]: i for i, r in enumerate(lrows, 1)}
         rows_by_id: dict[str, dict[str, Any]] = {}
         for r in (*vrows, *lrows):
             rows_by_id.setdefault(r["id"], r)
-        # Normalise fused score to [0,1] against the best possible (rank 1 in every
-        # list that returned anything) so it stays comparable to the blend weights.
-        max_rrf = (wv / (kk + 1) if vrows else 0.0) + (wl / (kk + 1) if lrows else 0.0)
-        if max_rrf == 0.0:
+        if not rows_by_id:
             return []
 
         # The reference point is the best candidate that cleared the absolute
@@ -222,16 +224,80 @@ class MemoryService:
                 row["similarity"] < floor or row["similarity"] < rel_floor
             ):
                 continue
-            rrf = 0.0
-            if mid in vrank:
-                rrf += wv / (kk + vrank[mid])
-            if mid in lrank:
-                rrf += wl / (kk + lrank[mid])
+            # Rank 1 earns the full boost; later ranks decay towards zero. Capped
+            # at 1.0 so relevance stays on the same scale as the blend weights.
+            bonus = (
+                s.hybrid_lexical_boost * (kk + 1) / (kk + lrank[mid]) if is_lexical else 0.0
+            )
+            relevance = min(1.0, row["similarity"] + bonus)
             hit = SearchHit(**row)
-            hit.score = self._rank_score(rrf / max_rrf, hit.importance, hit.last_accessed_at)
+            hit.score = self._rank_score(relevance, hit.importance, hit.last_accessed_at)
             hits.append(hit)
         hits.sort(key=lambda h: h.score, reverse=True)
         return hits[:k]
+
+    async def _fetch_candidates(
+        self,
+        conn,
+        *,
+        query: str,
+        scopes: list[str],
+        tags: list[str] | None,
+        k: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Pull the vector and lexical candidate lists that feed ``_fuse``.
+
+        Split out from ``search`` so ranking experiments can score alternative
+        fusion strategies against the exact candidates production would see,
+        rather than a reimplementation that could drift from this SQL.
+        """
+        # Pull a wider candidate pool than k from each signal, then fuse + re-rank
+        # in Python so recency/importance can reorder within the neighbourhood.
+        pool = max(k * self.settings.rerank_candidate_multiplier, k)
+        vec = await self._embed_query(query)
+        # HNSW post-filters on scope/tags during the index walk, so a filtered
+        # search can return fewer than `pool` rows. Widen ef_search past the pool
+        # (txn-local) so the scan keeps enough candidates to fill it. Capped at the
+        # pgvector max of 1000.
+        ef_search = min(max(pool * 2, 40), 1000)
+        params = {"q": vec, "scopes": scopes, "tags": tags, "pool": pool, "query": query}
+        await conn.execute("SELECT set_config('hnsw.ef_search', %s, true)", (str(ef_search),))
+        vrows = await (
+            await conn.execute(
+                f"""
+                SELECT {_SELECT_COLS}, 1 - (embedding <=> %(q)s) AS similarity
+                FROM memories
+                WHERE scope = ANY(%(scopes)s)
+                  AND archived_at IS NULL
+                  AND (%(tags)s::text[] IS NULL OR tags && %(tags)s)
+                ORDER BY embedding <=> %(q)s
+                LIMIT %(pool)s
+                """,
+                params,
+            )
+        ).fetchall()
+
+        lrows: list[dict[str, Any]] = []
+        if self.settings.hybrid_search:
+            # websearch_to_tsquery tolerates arbitrary user text (no syntax
+            # errors); an all-stopword query yields no matches -> pure vector.
+            lrows = await (
+                await conn.execute(
+                    f"""
+                    SELECT {_SELECT_COLS}, 1 - (embedding <=> %(q)s) AS similarity
+                    FROM memories
+                    WHERE scope = ANY(%(scopes)s)
+                      AND archived_at IS NULL
+                      AND (%(tags)s::text[] IS NULL OR tags && %(tags)s)
+                      AND content_tsv @@ websearch_to_tsquery('english', %(query)s)
+                    ORDER BY ts_rank_cd(content_tsv,
+                             websearch_to_tsquery('english', %(query)s)) DESC
+                    LIMIT %(pool)s
+                    """,
+                    params,
+                )
+            ).fetchall()
+        return vrows, lrows
 
     async def search(
         self,
@@ -257,55 +323,11 @@ class MemoryService:
             if relative_cutoff is None
             else relative_cutoff
         )
-        # Pull a wider candidate pool than k from each signal, then fuse + re-rank
-        # in Python so recency/importance can reorder within the neighbourhood.
-        pool = max(k * self.settings.rerank_candidate_multiplier, k)
-        vec = await self._embed_query(query)
-        # HNSW post-filters on scope/tags during the index walk, so a filtered
-        # search can return fewer than `pool` rows. Widen ef_search past the pool
-        # (txn-local) so the scan keeps enough candidates to fill it. Capped at the
-        # pgvector max of 1000.
-        ef_search = min(max(pool * 2, 40), 1000)
-        params = {"q": vec, "scopes": scopes, "tags": tags, "pool": pool, "query": query}
         async with self.pool.connection() as conn:
             conn.row_factory = dict_row
-            await conn.execute("SELECT set_config('hnsw.ef_search', %s, true)", (str(ef_search),))
-            vrows = await (
-                await conn.execute(
-                    f"""
-                    SELECT {_SELECT_COLS}, 1 - (embedding <=> %(q)s) AS similarity
-                    FROM memories
-                    WHERE scope = ANY(%(scopes)s)
-                      AND archived_at IS NULL
-                      AND (%(tags)s::text[] IS NULL OR tags && %(tags)s)
-                    ORDER BY embedding <=> %(q)s
-                    LIMIT %(pool)s
-                    """,
-                    params,
-                )
-            ).fetchall()
-
-            lrows: list[dict[str, Any]] = []
-            if self.settings.hybrid_search:
-                # websearch_to_tsquery tolerates arbitrary user text (no syntax
-                # errors); an all-stopword query yields no matches -> pure vector.
-                lrows = await (
-                    await conn.execute(
-                        f"""
-                        SELECT {_SELECT_COLS}, 1 - (embedding <=> %(q)s) AS similarity
-                        FROM memories
-                        WHERE scope = ANY(%(scopes)s)
-                          AND archived_at IS NULL
-                          AND (%(tags)s::text[] IS NULL OR tags && %(tags)s)
-                          AND content_tsv @@ websearch_to_tsquery('english', %(query)s)
-                        ORDER BY ts_rank_cd(content_tsv,
-                                 websearch_to_tsquery('english', %(query)s)) DESC
-                        LIMIT %(pool)s
-                        """,
-                        params,
-                    )
-                ).fetchall()
-
+            vrows, lrows = await self._fetch_candidates(
+                conn, query=query, scopes=scopes, tags=tags, k=k
+            )
             hits = self._fuse(vrows, lrows, floor, k, relative_cutoff=cutoff)
             if hits:
                 await conn.execute(

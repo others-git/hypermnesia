@@ -66,23 +66,46 @@ class Settings(BaseSettings):
 
     # Final ranking blends semantic similarity with recency and importance
     # (generative-agents style): score = w_sim*sim + w_recency*recency + w_importance*imp.
-    # similarity dominates by default so relevance still leads.
+    #
+    # These weights must be read against how much relevance actually VARIES, not
+    # against its nominal [0,1] range. Embedding models compress cosine into a
+    # narrow band — for bge-small-en-v1.5 every plausible hit lands in roughly
+    # 0.55-0.73 — so relevance moves a score by ~0.18 across a candidate set.
+    # The original 0.25/0.15 pair therefore let recency alone outweigh the entire
+    # usable similarity spread, and a stale-but-important memory beat the one
+    # that answered the query, despite the comment here claiming similarity led.
+    # Damped to a fraction of that spread so recency and importance break ties
+    # within a neighbourhood, which is what they are for, rather than choosing it.
     score_weight_similarity: float = 1.0
-    score_weight_recency: float = 0.25
-    score_weight_importance: float = 0.15
+    score_weight_recency: float = 0.10
+    score_weight_importance: float = 0.06
     recency_half_life_days: float = 30.0  # last_accessed_at decay half-life
     importance_cap: float = 2.0  # importance is normalised to [0,1] against this cap
     # Candidates fetched by vector distance before re-ranking = k * this multiplier.
     rerank_candidate_multiplier: int = 5
 
-    # Hybrid search: fuse semantic (vector) with lexical (Postgres full-text) recall
-    # via reciprocal-rank fusion, so exact tokens (error codes, flag names, paths)
-    # aren't lost to the embedding. The fused relevance then feeds the recency/
-    # importance blend above. A pure-lexical hit bypasses the similarity floor.
+    # Hybrid search: combine semantic (vector) with lexical (Postgres full-text)
+    # recall so exact tokens (error codes, flag names, paths) aren't lost to the
+    # embedding. Relevance is the cosine similarity itself, plus a bounded bonus
+    # for appearing in the lexical list; a pure-lexical hit also bypasses the
+    # similarity floor.
+    #
+    # This deliberately is NOT reciprocal-rank fusion. RRF keeps only ranks, so
+    # normalising it against "rank 1 in both lists" gave every lexical match a
+    # flat ~0.5 relevance jump over a vector-only hit — far more than the whole
+    # usable similarity spread, so a memory that merely happened to contain the
+    # query's function words outranked the one that answered it. Because
+    # websearch_to_tsquery ANDs every term, which memories match lexically is
+    # near-arbitrary for conversational queries, so that jump was mostly noise.
+    # Keeping calibrated similarity as the base and capping the lexical bonus
+    # preserves exact-token recall without letting it overrule meaning.
     hybrid_search: bool = True
-    rrf_k: int = 60  # reciprocal-rank-fusion constant; larger = flatter rank weighting
-    hybrid_vector_weight: float = 1.0
-    hybrid_lexical_weight: float = 1.0
+    # Most a lexical match can add to relevance, at lexical rank 1; the bonus
+    # decays with rank. Measured: 0.05-0.30 all behave the same on a labelled
+    # recall set, so this is a plateau rather than a knife-edge tuning constant.
+    hybrid_lexical_boost: float = 0.10
+    # Rank-decay constant for that bonus; larger = flatter across lexical ranks.
+    hybrid_rank_decay_k: int = 60
 
     # --- observability ---
     # Log every memory_search (query, candidate/hit counts, top scores, latency)

@@ -1,10 +1,14 @@
-"""Unit tests for reciprocal-rank fusion + blended ranking (no DB / embeddings).
+"""Unit tests for hybrid relevance + blended ranking (no DB / embeddings).
 
 `_fuse` is pure given `self.settings`, so we drive it with a service whose pool
 and embedder are unused.
 """
 
 from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pytest
 
 from hypermnesia.config import Settings
 from hypermnesia.service import MemoryService
@@ -35,8 +39,67 @@ def test_lexical_match_bypasses_similarity_floor():
     lrows = [_row("b", 0.1)]
     hits = svc._fuse(vrows, lrows, floor=0.4, k=10)
     ids = [h.id for h in hits]
-    assert ids == ["b", "a"]  # b wins: ranked in both lists
-    assert hits[0].similarity == 0.1  # raw cosine still reported
+    assert set(ids) == {"a", "b"}  # b is returned despite being under the floor
+    assert ids[0] == "a"  # ...but a far better semantic match still outranks it
+    assert next(h for h in hits if h.id == "b").similarity == 0.1  # raw cosine reported
+
+
+def test_lexical_bonus_cannot_overturn_a_clearly_better_semantic_match():
+    # The bug this replaced RRF to fix: normalising fused ranks gave any lexical
+    # match a ~0.5 relevance jump, so an incidental keyword match outranked the
+    # memory that actually answered the query. The bonus is now bounded.
+    svc = _svc(hybrid_lexical_boost=0.10)
+    vrows = [_row("answers-it", 0.72), _row("shares-wording", 0.60)]
+    lrows = [_row("shares-wording", 0.60)]
+    hits = svc._fuse(vrows, lrows, floor=0.4, k=10)
+    assert [h.id for h in hits] == ["answers-it", "shares-wording"]
+
+
+def test_lexical_bonus_wins_a_near_tie():
+    # ...but it must still do its job: on a near-tie the exact-token match leads,
+    # which is the whole reason for running a lexical query at all.
+    svc = _svc(hybrid_lexical_boost=0.10)
+    vrows = [_row("no-token", 0.62), _row("has-token", 0.60)]
+    lrows = [_row("has-token", 0.60)]
+    hits = svc._fuse(vrows, lrows, floor=0.4, k=10)
+    assert [h.id for h in hits] == ["has-token", "no-token"]
+
+
+def test_lexical_bonus_decays_with_lexical_rank():
+    svc = _svc(hybrid_lexical_boost=0.10, hybrid_rank_decay_k=1)
+    vrows = [_row("first", 0.60), _row("tenth", 0.60)]
+    lrows = [_row("first", 0.60)] + [_row(str(i), 0.60) for i in range(8)] + [_row("tenth", 0.60)]
+    hits = svc._fuse(vrows, lrows, floor=0.4, k=20)
+    by_id = {h.id: h.score for h in hits}
+    assert by_id["first"] > by_id["tenth"]
+
+
+def test_zero_lexical_boost_makes_relevance_pure_similarity():
+    svc = _svc(hybrid_lexical_boost=0.0)
+    vrows = [_row("a", 0.9), _row("b", 0.5)]
+    lrows = [_row("b", 0.5)]
+    hits = svc._fuse(vrows, lrows, floor=0.0, k=10)
+    assert [h.id for h in hits] == ["a", "b"]
+    assert hits[0].score == pytest.approx(svc._rank_score(0.9, 1.0, None))
+
+
+def test_relevance_is_capped_at_one():
+    svc = _svc(hybrid_lexical_boost=0.30)
+    vrows = [_row("a", 0.99)]
+    lrows = [_row("a", 0.99)]
+    hits = svc._fuse(vrows, lrows, floor=0.0, k=10)
+    assert hits[0].score == pytest.approx(svc._rank_score(1.0, 1.0, None))
+
+
+def test_recency_and_importance_cannot_outweigh_the_similarity_spread():
+    # Weights are only meaningful against how much relevance actually varies.
+    # Embedding cosine is compressed (bge-small: plausible hits ~0.55-0.73), so a
+    # weight large enough to span that band lets a stale-but-important memory
+    # beat the one that answers the query. Guards the damped defaults.
+    svc = _svc()
+    best_case = svc._rank_score(0.55, 2.0, datetime.now(timezone.utc))  # worst rel, best rest
+    worst_case = svc._rank_score(0.73, 0.0, None)  # best rel, worst rest
+    assert worst_case > best_case
 
 
 def test_vector_only_below_floor_is_dropped():
@@ -99,14 +162,13 @@ def test_stats_with_no_scopes_is_a_noop():
     assert res["recent_empty_queries"] == []
 
 
-def test_importance_breaks_ties_within_a_rank():
-    # Same rank in the same single list -> relevance ties; importance decides.
+def test_importance_breaks_an_exact_relevance_tie():
+    # Identical similarity and no lexical match -> relevance ties exactly, so
+    # importance is left to decide. This is the role it should have: a tie-break,
+    # not a lever big enough to reorder genuinely different relevances.
     svc = _svc()
     vrows = [_row("low", 0.8, importance=0.0), _row("high", 0.8, importance=2.0)]
-    # both are vector rank 1 and 2; give them equal vector rank by using two lists
-    # that cross so rrf is symmetric, isolating importance.
-    lrows = [_row("high", 0.8, importance=2.0), _row("low", 0.8, importance=0.0)]
-    hits = svc._fuse(vrows, lrows, floor=0.0, k=10)
+    hits = svc._fuse(vrows, [], floor=0.0, k=10)
     assert hits[0].id == "high"
 
 
