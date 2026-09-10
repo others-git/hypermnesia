@@ -179,12 +179,15 @@ class MemoryService:
         lrows: list[dict[str, Any]],
         floor: float,
         k: int,
+        relative_cutoff: float = 0.0,
     ) -> list[SearchHit]:
         """Reciprocal-rank-fuse vector + lexical candidates, then blend and rank.
 
         ``vrows`` are ordered by vector distance, ``lrows`` by lexical rank; each
-        row carries cosine ``similarity``. The similarity floor drops purely
-        semantic candidates, but a lexical match bypasses it (an exact-token hit is
+        row carries cosine ``similarity``. Two gates drop purely semantic
+        candidates: the absolute ``floor``, and ``relative_cutoff`` — how far
+        below the best hit of this search a candidate may fall before it counts
+        as noise beside it. A lexical match bypasses both (an exact-token hit is
         intentional relevance, not noise). Returns the top ``k`` SearchHits.
         """
         s = self.settings
@@ -201,10 +204,23 @@ class MemoryService:
         if max_rrf == 0.0:
             return []
 
+        # The reference point is the best candidate that cleared the absolute
+        # floor — not merely the best kept hit — so a weak lexical match riding
+        # its floor bypass into the results can't redefine what counts as "near
+        # the best" for everything else.
+        above_floor = [r["similarity"] for r in rows_by_id.values() if r["similarity"] >= floor]
+        rel_floor = (
+            max(above_floor) - relative_cutoff
+            if above_floor and relative_cutoff > 0
+            else float("-inf")
+        )
+
         hits: list[SearchHit] = []
         for mid, row in rows_by_id.items():
             is_lexical = mid in lrank
-            if not is_lexical and row["similarity"] < floor:
+            if not is_lexical and (
+                row["similarity"] < floor or row["similarity"] < rel_floor
+            ):
                 continue
             rrf = 0.0
             if mid in vrank:
@@ -225,6 +241,7 @@ class MemoryService:
         tags: list[str] | None = None,
         k: int = 8,
         min_similarity: float | None = None,
+        relative_cutoff: float | None = None,
         owner_id: str | None = None,
     ) -> list[SearchHit]:
         if not scopes:
@@ -234,6 +251,11 @@ class MemoryService:
             self.settings.search_min_similarity
             if min_similarity is None
             else min_similarity
+        )
+        cutoff = (
+            self.settings.search_relative_cutoff
+            if relative_cutoff is None
+            else relative_cutoff
         )
         # Pull a wider candidate pool than k from each signal, then fuse + re-rank
         # in Python so recency/importance can reorder within the neighbourhood.
@@ -284,7 +306,7 @@ class MemoryService:
                     )
                 ).fetchall()
 
-            hits = self._fuse(vrows, lrows, floor, k)
+            hits = self._fuse(vrows, lrows, floor, k, relative_cutoff=cutoff)
             if hits:
                 await conn.execute(
                     "UPDATE memories SET last_accessed_at = now() WHERE id = ANY(%s)",

@@ -48,6 +48,22 @@ class Settings(BaseSettings):
     # Re-tune if you change embedding models. 0.0 disables; callers override per-search.
     search_min_similarity: float = 0.4
 
+    # Second recall gate, relative instead of absolute: drop a hit whose cosine
+    # similarity falls more than this far below the best hit of the same search.
+    # An absolute floor cannot separate signal from noise on its own, because
+    # every model has its own cosine range and unrelated text still scores well
+    # inside it (measured on bge-small: unrelated memories sit ~0.43-0.62 while
+    # relevant ones sit ~0.50-0.85, so the two overlap and *no* single floor
+    # splits them). The distance to the best hit does separate them, and it
+    # travels across models: on an 11-query memory-shaped eval this kept every
+    # relevant hit while cutting irrelevant ones from 77 to 15, where the
+    # tightest absolute floor that trimmed as much already lost a relevant hit.
+    # A flat, standout-free result set (an off-topic query) is left alone, so
+    # this narrows a good answer's neighbourhood rather than inventing one.
+    # Lexical hits bypass it, as they do the floor. 0.0 disables; callers
+    # override per-search.
+    search_relative_cutoff: float = 0.15
+
     # Final ranking blends semantic similarity with recency and importance
     # (generative-agents style): score = w_sim*sim + w_recency*recency + w_importance*imp.
     # similarity dominates by default so relevance still leads.
@@ -89,6 +105,10 @@ class Settings(BaseSettings):
     # --- server ---
     host: str = "127.0.0.1"
     port: int = 8765
+    # Root log level for the `hypermnesia` logger. Without this nothing
+    # configures logging, so the forget sweep's report of what it archived —
+    # and the debug line for a failed roots handshake — go nowhere.
+    log_level: str = "INFO"
 
     # --- auth ---
     # JSON: {"<bearer-token>": {"principal": "agent-a", "scopes": ["shared", "user:dev-test"]}}
